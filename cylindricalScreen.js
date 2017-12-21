@@ -17,7 +17,8 @@ var cylindricalScreen = {
     },
 
     createGeometry : function() {
-	this.radius = this.focalLength(this.imageWidth, this.horizontalFieldOfView);
+	if (this.radius < 0)
+	    this.radius = this.focalLength(this.imageWidth, this.horizontalFieldOfView);
 
 	var numVerts = 2*this.numberOfQuads + 2;
 	if (!this.verts || this.verts.length != 3*numVerts) {
