@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+<meta charset="utf=8" />
+
+<title>Point Cloud</title>
+
+<style>
+body {
+  background-color : whitesmoke;
+  font-family: "Helvetica", sans-serif;
+}
+.progress .progress-bar {
+  -webkit-transition: none;
+       -o-transition: none;
+          transition: none;
+}
+
+footer {
+  font-size : 0.7 em;
+  font-family: "Helvetica", sans-serif;
+  font-style: italic;
+}
+</style>
+
+<script src="matrix.js"></script>
+<script src="octree.js"></script>
+<script src="pc000-8.js"></script>
+<script src="annotations.js"></script>
+        
+<script id="vertex" type="x-shader">
+      precision highp float;
+      attribute vec3 vertexPosition;
+      attribute float vertexColorIndex;
+      varying float colorIndex;
+      uniform mat4 ModelViewProjection;
+      uniform vec3 vertScale, vertShift;
+      uniform float pointSize;
+      void main() {
+          vec3 pos = vertScale*vertexPosition + vertShift;
+          gl_Position = ModelViewProjection*vec4(pos,1.0);
+		  gl_PointSize = pointSize;
+          colorIndex = vertexColorIndex;
+      }
+</script>
+
+<script id="fragment" type="x-shader">
+      precision highp float;
+      varying float colorIndex;
+      uniform float colorMapSize;
+      uniform sampler2D texUnit;
+      void main() {
+          vec2 texCoord = vec2((colorIndex + 0.5)/colorMapSize, 0.0);
+          vec4 color = texture2D(texUnit, texCoord);
+          gl_FragColor = vec4(color.r, color.g, color.b, 1.0);
+       }
+</script>
+
+<script>
+  var gl;
+  var canvas;
+  var program;
+  var camera;
+  var Model, View, Projection;
+  var pointSize = 3.0;
+  var pointclouds = [];
+
+  function getMousePos(canvas, event) {
+      var rect = canvas.getBoundingClientRect();
+      return {
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top
+      };
+  }
+
+  var mouseDrag;
+  var touchDrag;
+
+  function mouseDown(event) {
+      mouseDrag = getMousePos(canvas, event);
+  }
+
+  function touchDown(event) {
+      event.preventDefault(); // prevent mouse event from being delivered
+      touchDrag = { 
+          x: event.touches[0].clientX, // position of first finger
+          y: event.touches[0].clientY
+      };
+  }
+
+  var radiansPerPixel = 0.01;
+  // var phiMin = -Math.PI/2 + 0.001;
+  var phiMin = -0.1; // keep eye above plane
+  var phiMax = +Math.PI/2 - 0.001;
+
+  var frame; // current anim frame (undefined => no frame)
+
+  function updateCameraAngle(dx, dy) {
+        camera.theta -= dx*radiansPerPixel;
+        camera.phi += dy*radiansPerPixel;
+        if (camera.phi < phiMin)
+            camera.phi = phiMin;
+        else if (camera.phi > phiMax)
+            camera.phi = phiMax;
+  }
+
+  function mouseMove(event) {
+      if (mouseDrag) {
+          var mousePos = getMousePos(canvas, event);
+          var dx = mousePos.x - mouseDrag.x;
+          var dy = mousePos.y - mouseDrag.y;
+          updateCameraAngle(dx, dy);
+          mouseDrag = mousePos;
+          if (!frame)
+             frame = requestAnimationFrame(display);
+      }
+  }
+
+  function touchMove(event) {
+      if (touchDrag) {
+            event.preventDefault();
+            var touchPos = {
+                x: event.touches[0].clientX,
+                y: event.touches[0].clientY
+            };
+            var dx = touchPos.x - touchDrag.x;
+            var dy = touchPos.y - touchDrag.y;
+            updateCameraAngle(dx, dy);
+            touchDrag = touchPos;
+            if (!frame)
+                frame = requestAnimationFrame(display);
+      }
+  }
+
+  function mouseUp(event) {
+      var mousePos = getMousePos(canvas, event);
+      mouseDrag = null;
+  }
+
+  function touchUp(event) {
+      touchDrag = null;
+  }
+
+  function init() {
+      canvas = document.getElementById("myCanvas");
+      gl = null;
+      try {
+          gl = canvas.getContext("webgl", {stencil : true});
+      } catch(e) {gl = null;}
+      if (gl == null) {
+          alert("No WebGL -- bummer!");
+          return false;
+      }
+
+      canvas.addEventListener("mousedown", mouseDown, false);
+      canvas.addEventListener("mousemove", mouseMove, false);
+      document.body.addEventListener("mouseup", mouseUp, false);
+
+      canvas.addEventListener("touchstart", touchDown, false);
+      canvas.addEventListener("touchmove", touchMove, false);
+      document.body.addEventListener("touchend", touchUp, false);
+
+      var v = document.getElementById("vertex").firstChild.nodeValue;
+      var vs = gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(vs,v);
+      gl.compileShader(vs);
+      if (!gl.getShaderParameter(vs,gl.COMPILE_STATUS)) {
+          alert(gl.getShaderInfoLog(vs));
+          return false; 
+      }
+
+      var f = document.getElementById("fragment").firstChild.nodeValue;
+      var fs = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fs,f);
+      gl.compileShader(fs);
+      if (!gl.getShaderParameter(fs,gl.COMPILE_STATUS)) {
+          alert(gl.getShaderInfoLog(fs));
+          return false;
+      }
+      
+      program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+
+      gl.useProgram(program);
+
+      program.vertexPosition = gl.getAttribLocation(program, "vertexPosition");
+      program.vertexColorIndex = gl.getAttribLocation(program, "vertexColorIndex");
+      
+      program.ModelViewProjection = gl.getUniformLocation(program, "ModelViewProjection");
+      program.vertScale = gl.getUniformLocation(program, "vertScale");
+      program.vertShift = gl.getUniformLocation(program, "vertShift");
+      program.pointSize = gl.getUniformLocation(program, "pointSize");
+      program.colorMapSize = gl.getUniformLocation(program, "colorMapSize");
+      program.texUnit = gl.getUniformLocation(program, "texUnit");
+
+      program.vertbuffer = gl.createBuffer();
+      program.colorIndexBuffer = gl.createBuffer();
+      program.texture = gl.createTexture();
+
+      gl.uniform1i(program.texUnit, 0);   
+
+      pointcloud = decompressPointCloud(pointcloud);
+      loadPointCloudGLBuffers(pointcloud);
+
+      // XXX gl.clearColor(1,1,1,1);
+      gl.clearColor(0.7,0.7,0.7,1);
+      
+      View = new Matrix4x4;
+      Model = new Matrix4x4;
+
+	  var dx = pointcloud.bbox.max[0] - pointcloud.bbox.min[0];
+	  var dy = pointcloud.bbox.max[1] - pointcloud.bbox.min[1];
+	  var dz = pointcloud.bbox.max[2] - pointcloud.bbox.min[2];
+	  var diag = Math.sqrt(dx*dx + dy*dy + dz*dz);
+	  var cx = (pointcloud.bbox.max[0] + pointcloud.bbox.min[0])/2;
+	  var cy = (pointcloud.bbox.max[1] + pointcloud.bbox.min[1])/2;
+	  var cz = (pointcloud.bbox.max[2] + pointcloud.bbox.min[2])/2;
+
+      camera = {};
+      camera.lookat = {x : cx, y : cy, z : cz};
+      camera.distance = 6*diag; // XXX 1.1*diag;
+      Projection = new Matrix4x4;
+      // XXX Projection.perspective(40, 1, 0.1, 300);
+
+	  var view = 0;
+
+	  if (view == 0) {  // XY
+		  Projection.ortho(-dx/2, +dx/2, -dy/2, +dy/2,
+						   0.1, 600);
+		  camera.phi = 0; // Math.PI/6;
+		  camera.theta = 0; // Math.PI; // Math.PI/4;
+	      camera.up = {x:0, y:1, z:0};
+	  } else if (view == 1) { // XZ
+		  Projection.ortho(-dz/2, +dz/2, -dy/2, +dy/2,
+						   0.1, 600);
+		  camera.phi = 0; // Math.PI/6;
+		  camera.theta = Math.PI/2; // Math.PI/4;
+	      camera.up = {x:0, y:1, z:0};
+	  } else { // view == 2
+		  Projection.ortho(-dx/2, +dx/2, -dz/2, +dz/2,
+						   0.1, 600);
+		  camera.phi = -Math.PI/2; // Math.PI/6;
+		  camera.theta = 0; // Math.PI/4;		  
+	      camera.up = {x:0, y:0, z:1};
+	  }
+
+      gl.viewport(0,0,canvas.width,canvas.height);
+
+      gl.enable(gl.DEPTH_TEST);
+  }
+
+  function getCameraPosition() {
+      var d_cos_phi = camera.distance*Math.cos(camera.phi);
+      camera.x = d_cos_phi*Math.sin(camera.theta) + camera.lookat.x;
+      camera.z = d_cos_phi*Math.cos(camera.theta) + camera.lookat.z;
+      camera.y = camera.distance*Math.sin(camera.phi) + camera.lookat.y;
+  }
+
+  function drawSpherePointCloud(x,y,z, rad) {
+        if (typeof(drawSpherePointCloud.vertBuffer) === 'undefined') {
+
+            const SLICES = 8;
+            const DICES = 8;
+            const dtheta = 2*Math.PI/DICES;
+            const dphi = Math.PI/(SLICES+1);
+            var coords = [], colors = [];
+            for (let j = 1; j <= SLICES; j++) {
+                var phi = -Math.PI/2 + j*dphi;
+                var cos_phi = Math.cos(phi);
+                var z = Math.sin(phi);
+                for (let i = 0; i < DICES; i++) {
+                    var theta = i*dtheta;
+                    var x = cos_phi*Math.cos(theta);
+                    var y = cos_phi*Math.sin(theta);
+                    coords.push(x, y, z);
+                    colors.push(1);
+                }  
+            }
+
+            var quantizedPoints = coords.map(x => Math.round(65535*(x+1)/2));
+            
+            drawSpherePointCloud.bbox = { min : [-1, -1, -1], max : [1,1,1]};
+            drawSpherePointCloud.numVerts = SLICES * DICES;
+            drawSpherePointCloud.vertShorts = new Uint16Array(quantizedPoints);
+            drawSpherePointCloud.colorMapSize = 2;
+            drawSpherePointCloud.colorMapBytes = new Uint8Array([0,0,0, 255,0,0]);
+            drawSpherePointCloud.colorIndexBytes = new Uint8Array(colors);
+
+            drawSpherePointCloud.vertBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, drawSpherePointCloud.vertBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, 
+                drawSpherePointCloud.vertShorts, gl.STATIC_DRAW);   
+
+            drawSpherePointCloud.colorIndexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, drawSpherePointCloud.colorIndexBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, 
+                drawSpherePointCloud.colorIndexBytes, gl.STATIC_DRAW);
+
+            drawSpherePointCloud.texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, drawSpherePointCloud.texture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB,  
+                drawSpherePointCloud.colorMapSize, 1, 0, 
+                gl.RGB, gl.UNSIGNED_BYTE,
+                drawSpherePointCloud.colorMapBytes);
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, drawSpherePointCloud.vertBuffer);
+        gl.enableVertexAttribArray(program.vertexPosition);
+        gl.vertexAttribPointer(program.vertexPosition, 3, gl.UNSIGNED_SHORT, true, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, drawSpherePointCloud.colorIndexBuffer);
+        gl.enableVertexAttribArray(program.vertexColorIndex);
+        gl.vertexAttribPointer(program.vertexColorIndex, 1, gl.UNSIGNED_BYTE, false, 0, 0);
+
+        gl.bindTexture(gl.TEXTURE_2D, drawSpherePointCloud.texture);
+        gl.uniform1f(program.colorMapSize, drawSpherePointCloud.colorMapSize);
+        bbox = {
+            min : [x - rad, y - rad, z - rad], 
+            max : [x + rad, y + rad, z + rad]
+        };
+        var scale = [
+            bbox.max[0] - bbox.min[0], 
+            bbox.max[1] - bbox.min[1],
+            bbox.max[2] - bbox.min[2]
+        ];
+        gl.uniform3fv(program.vertScale, scale);
+        gl.uniform3fv(program.vertShift, bbox.min);
+        gl.uniform1f(program.pointSize, 1.0);
+
+        gl.drawArrays(gl.POINTS, 0, drawSpherePointCloud.numVerts);
+  }
+
+  function drawBox(x,y,z, w,h,d) {
+        if (typeof(drawBox.vertBuffer) === 'undefined') {
+			var coords = [ // lines = edges of box
+				0,0,0, 1,0,0,
+				0,0,0, 0,1,0,
+				0,0,0, 0,0,1,
+				0,1,1, 1,1,1,
+				0,1,1, 0,0,1,
+				0,1,1, 0,1,0,
+				1,1,0, 0,1,0,
+				1,1,0, 1,0,0,
+				1,1,0, 1,1,1,
+				1,0,1, 0,0,1,
+				1,0,1, 1,1,1,
+				1,0,1, 1,0,0
+			];
+			var colors = new Array(24);
+			colors.fill(1,0);
+
+			var quantizedPoints = coords.map(x => Math.round(65535*x));
+		
+			drawBox.bbox = { min : [0,0,0], max : [1,1,1]};
+			drawBox.numVerts = 24;
+			drawBox.vertShorts = new Uint16Array(quantizedPoints);
+			drawBox.colorMapSize = 2;
+			drawBox.colorMapBytes = new Uint8Array([0,0,0, 255,255,0]);
+			drawBox.colorIndexBytes = new Uint8Array(colors);
+
+			drawBox.vertBuffer = gl.createBuffer();
+			gl.bindBuffer(gl.ARRAY_BUFFER, drawBox.vertBuffer);
+			gl.bufferData(gl.ARRAY_BUFFER, 
+						  drawBox.vertShorts, gl.STATIC_DRAW);   
+			
+			drawBox.colorIndexBuffer = gl.createBuffer();
+			gl.bindBuffer(gl.ARRAY_BUFFER, drawBox.colorIndexBuffer);
+			gl.bufferData(gl.ARRAY_BUFFER, 
+						  drawBox.colorIndexBytes, gl.STATIC_DRAW);
+			
+			drawBox.texture = gl.createTexture();
+			gl.bindTexture(gl.TEXTURE_2D, drawBox.texture);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB,  
+						  drawBox.colorMapSize, 1, 0, 
+						  gl.RGB, gl.UNSIGNED_BYTE,
+						  drawBox.colorMapBytes);
+		}
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, drawBox.vertBuffer);
+        gl.enableVertexAttribArray(program.vertexPosition);
+        gl.vertexAttribPointer(program.vertexPosition, 3, gl.UNSIGNED_SHORT, true, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, drawBox.colorIndexBuffer);
+        gl.enableVertexAttribArray(program.vertexColorIndex);
+        gl.vertexAttribPointer(program.vertexColorIndex, 1, gl.UNSIGNED_BYTE, false, 0, 0);
+
+        gl.bindTexture(gl.TEXTURE_2D, drawBox.texture);
+        gl.uniform1f(program.colorMapSize, drawBox.colorMapSize);
+
+		var scale = [w, h, d];
+		var shift = [x, y, z];
+        gl.uniform3fv(program.vertScale, scale);
+        gl.uniform3fv(program.vertShift, shift);
+		
+        gl.drawArrays(gl.LINES, 0, drawBox.numVerts);
+  }
+
+  function drawAxes(x,y,z, w,h,d) {
+        if (typeof(drawAxes.vertBuffer) === 'undefined') {
+			var coords = [ // lines = edges of box
+				0,0,0, 1,0,0,
+				0,0,0, 0,1,0,
+				0,0,0, 0,0,1,
+			];
+			var colors = [1, 1, 2, 2, 3, 3];
+
+			var quantizedPoints = coords.map(x => Math.round(65535*x));
+		
+			drawAxes.bbox = { min : [0,0,0], max : [1,1,1]};
+			drawAxes.numVerts = 6;
+			drawAxes.vertShorts = new Uint16Array(quantizedPoints);
+			drawAxes.colorMapSize = 4;
+			drawAxes.colorMapBytes = new Uint8Array(
+				[0,0,0, 255,0,0, 0,255,0, 0,0,255]
+			);
+			drawAxes.colorIndexBytes = new Uint8Array(colors);
+
+			drawAxes.vertBuffer = gl.createBuffer();
+			gl.bindBuffer(gl.ARRAY_BUFFER, drawAxes.vertBuffer);
+			gl.bufferData(gl.ARRAY_BUFFER, 
+						  drawAxes.vertShorts, gl.STATIC_DRAW);   
+			
+			drawAxes.colorIndexBuffer = gl.createBuffer();
+			gl.bindBuffer(gl.ARRAY_BUFFER, drawAxes.colorIndexBuffer);
+			gl.bufferData(gl.ARRAY_BUFFER, 
+						  drawAxes.colorIndexBytes, gl.STATIC_DRAW);
+			
+			drawAxes.texture = gl.createTexture();
+			gl.bindTexture(gl.TEXTURE_2D, drawAxes.texture);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB,  
+						  drawAxes.colorMapSize, 1, 0, 
+						  gl.RGB, gl.UNSIGNED_BYTE,
+						  drawAxes.colorMapBytes);
+		}
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, drawAxes.vertBuffer);
+        gl.enableVertexAttribArray(program.vertexPosition);
+        gl.vertexAttribPointer(program.vertexPosition, 3, gl.UNSIGNED_SHORT, true, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, drawAxes.colorIndexBuffer);
+        gl.enableVertexAttribArray(program.vertexColorIndex);
+        gl.vertexAttribPointer(program.vertexColorIndex, 1, gl.UNSIGNED_BYTE, false, 0, 0);
+
+        gl.bindTexture(gl.TEXTURE_2D, drawAxes.texture);
+        gl.uniform1f(program.colorMapSize, drawAxes.colorMapSize);
+
+		var scale = [w, h, d];
+		var shift = [x, y, z];
+        gl.uniform3fv(program.vertScale, scale);
+        gl.uniform3fv(program.vertShift, shift);
+		
+        gl.drawArrays(gl.LINES, 0, drawAxes.numVerts);
+  }
+
+  function setModelViewProjection() {
+      getCameraPosition();
+      View.identity();
+      View.lookat(camera.x, camera.y, camera.z,
+                  camera.lookat.x, camera.lookat.y, camera.lookat.z,
+                  camera.up.x, camera.up.y, camera.up.z); // XXX 0, 1, 0);
+      var ModelView = View.mult(Model);
+      var MVP = Projection.mult(ModelView);
+      gl.uniformMatrix4fv(program.ModelViewProjection, false, MVP.array);
+  }
+
+  function drawGroundPlane(x0, x1, z0, z1, y0) {
+      if (typeof(drawGroundPlane.vertBuffer) === 'undefined') {
+            drawGroundPlane.numVerts = 4;
+            drawGroundPlane.vertFloats = new Float32Array([
+                0,0,0, 0,0,1, 1,0,0, 1,0,1
+            ]);
+            drawGroundPlane.colorMapSize = 2;
+            drawGroundPlane.colorMapBytes = new Uint8Array([
+                0,0,0, 100,120,255
+            ]);
+            drawGroundPlane.colorIndexBytes = new Uint8Array([ 1, 1, 1, 1]);
+
+            drawGroundPlane.vertBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, drawGroundPlane.vertBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, drawGroundPlane.vertFloats, gl.STATIC_DRAW);
+
+            drawGroundPlane.colorIndexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, drawGroundPlane.colorIndexBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, drawGroundPlane.colorIndexBytes, gl.STATIC_DRAW);
+
+            drawGroundPlane.texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, drawGroundPlane.texture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB,
+                drawGroundPlane.colorMapSize, 1, 0,
+                gl.RGB, gl.UNSIGNED_BYTE, drawGroundPlane.colorMapBytes);
+      }
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, drawGroundPlane.vertBuffer);
+      gl.enableVertexAttribArray(program.vertexPosition);
+      gl.vertexAttribPointer(program.vertexPosition, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, drawGroundPlane.colorIndexBuffer);
+      gl.enableVertexAttribArray(program.vertexColorIndex);
+      gl.vertexAttribPointer(program.vertexColorIndex, 1, gl.UNSIGNED_BYTE, false, 0, 0);
+
+      gl.bindTexture(gl.TEXTURE_2D, drawGroundPlane.texture);
+      gl.uniform1f(program.colorMapSize,  drawGroundPlane.colorMapSize);
+      gl.uniform3fv(program.vertScale, [x1 - x0, 1, z1 - z0]);
+      gl.uniform3fv(program.vertShift, [x0, y0, z0]);
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, drawGroundPlane.numVerts);
+  }
+
+  function drawPoints(pc) {
+        // Note: there is a single vertex, color index buffer, and texture
+        // for all the loaded PC's and these buffers are properties
+        // of the GL program. We assume these buffers hold the proper
+        // PC data at this point (see loadPointCloudGLBuffers() function).
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, program.vertbuffer);
+        gl.enableVertexAttribArray(program.vertexPosition);
+        gl.vertexAttribPointer(program.vertexPosition, 3, gl.UNSIGNED_SHORT, true, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, program.colorIndexBuffer);
+        gl.enableVertexAttribArray(program.vertexColorIndex);
+        gl.vertexAttribPointer(program.vertexColorIndex, 1, gl.UNSIGNED_BYTE, false, 0, 0);
+
+        gl.bindTexture(gl.TEXTURE_2D, program.texture);
+
+        gl.uniform1f(program.colorMapSize, pc.colorMapSize);
+
+        var scale = [
+            pc.bbox.max[0] - pc.bbox.min[0], 
+            pc.bbox.max[1] - pc.bbox.min[1],
+            pc.bbox.max[2] - pc.bbox.min[2]
+        ];
+        gl.uniform3fv(program.vertScale, scale);
+        gl.uniform3fv(program.vertShift, pc.bbox.min);
+
+        gl.drawArrays(gl.POINTS, 0, pc.numVerts);
+  }
+
+
+  var sphere = null;
+
+  var drawReflections = true;
+  var drawShadows = false;
+
+  function toggleShadow(checkbox) {
+    drawShadows = !drawShadows;
+    if (!frame)
+        frame = requestAnimationFrame(display);
+  }
+
+  function toggleReflection(checkbox) {
+    drawReflections = !drawReflections;
+    if (!frame)
+        frame = requestAnimationFrame(display);
+  }
+
+  function drawAnnotations() {
+	  gl.lineWidth(1);
+
+	  annotations.boxes.forEach(function(box) {
+		  var x = box.min[0];
+		  var y = box.min[1];
+		  var z = box.min[2];
+		  var w = box.max[0] - box.min[0];
+		  var h = box.max[1] - box.min[1];
+		  var d = box.max[2] - box.min[2];
+		  drawBox(x,y,z, w,h,d);
+	  });
+  }
+
+  function display() {
+        frame = undefined;
+
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+        
+        gl.uniform1f(program.pointSize, pointSize);
+        
+        setModelViewProjection();
+
+        gl.enable(gl.DEPTH_TEST);
+        gl.disable(gl.STENCIL_TEST);
+        gl.disable(gl.BLEND);
+        drawPoints(pointcloud);
+		drawAnnotations();
+		drawAxes(pointcloud.centroid[0], pointcloud.centroid[1], pointcloud.centroid[2],
+				 4, 4, 4);
+		var expand = 0.25;
+		drawBox(pointcloud.bbox.min[0] + expand, 
+				pointcloud.bbox.min[1] + expand,
+				pointcloud.bbox.min[2] + expand,
+				(pointcloud.bbox.max[0] - pointcloud.bbox.min[0]) - 2*expand,
+				(pointcloud.bbox.max[1] - pointcloud.bbox.min[1]) - 2*expand,
+				(pointcloud.bbox.max[2] - pointcloud.bbox.min[2]) - 2*expand);
+        
+        if (sphere) {
+                drawSpherePointCloud(sphere.x, sphere.y, sphere.z, 1.0);
+        }
+
+        var floorMin = [-80, -15];
+        var floorMax = [43, 45];
+        var floorZero = +0.1;   
+
+        gl.enable(gl.STENCIL_TEST);
+        gl.stencilFunc(gl.ALWAYS, 1, 1);
+        gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+        drawGroundPlane(floorMin[0], floorMax[0], floorMin[1], floorMax[1], floorZero);
+
+        if (drawReflections || drawShadows)
+             gl.clear(gl.DEPTH_BUFFER_BIT);
+
+        if (drawReflections) {
+            gl.stencilFunc(gl.EQUAL, 1, 1);
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+            var matrixStack = new Matrix4x4Stack();
+            matrixStack.push(Model);
+            var Reflect = new Matrix4x4().scale(1,-1,1);
+            Model.concat(Reflect);
+            setModelViewProjection();
+            drawPoints(pointcloud);
+            matrixStack.pop(Model);
+
+            gl.enable(gl.BLEND);
+            gl.blendColor(1,1,1, 0.7);
+            gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
+            drawGroundPlane(floorMin[0], floorMax[0], floorMin[1], floorMax[1], floorZero);
+        }
+
+        if (drawShadows) {
+            var light = [0, 40, 10, 1];
+            var ViewInverse = new Matrix4x4;
+            ViewInverse.inverseLookat(camera.x, camera.y, camera.z,
+                camera.lookat.x, camera.lookat.y, camera.lookat.z,
+                0, 1, 0);
+            var L = ViewInverse.transform(light);
+
+            gl.enable(gl.BLEND);
+            gl.blendColor(0,0,0, 1);
+            gl.blendFunc(gl.CONSTANT_COLOR, gl.DST_COLOR);
+            gl.stencilFunc(gl.EQUAL, 1,1);
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.ZERO);
+            var matrixStack = new Matrix4x4Stack();
+            matrixStack.push(Model);
+            Model.shadow(light, [0, 1, 0, 0]);
+            gl.enable(gl.POLYGON_OFFSET_FILL);
+            gl.polygonOffset(-1, -1);
+            setModelViewProjection();
+            drawPoints(pointcloud);
+            gl.disable(gl.POLYGON_OFFSET_FILL);
+            matrixStack.pop(Model);
+        }
+
+        gl.flush();
+  }
+
+  function changePointSize(dropdown) {
+      pointSize = dropdown.value;
+	  if (!frame)
+		  frame = requestAnimationFrame(display);
+  }
+
+  function loadJSON(fname, callback) {
+	  var xobj = new XMLHttpRequest();
+      xobj.overrideMimeType("application/json");
+      xobj.open('GET', fname, true);
+	  xobj.onreadystatechange = function () {
+		  if (xobj.readyState == 4) {
+			  if (xobj.status == 200 ) {  // 0 for local file:
+				  callback(xobj.responseText);
+			  }
+		  }
+	  };
+      xobj.send(null);
+  }
+
+  function loadPointCloudGLBuffers(pc) {
+	  var numVerts = pc.numVerts;
+      
+ 	  gl.bindBuffer(gl.ARRAY_BUFFER, program.vertbuffer);
+	  gl.bufferData(gl.ARRAY_BUFFER, pc.vertShorts, gl.DYNAMIC_DRAW);
+	  
+	  gl.bindBuffer(gl.ARRAY_BUFFER, program.colorIndexBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, pc.colorIndexBytes, gl.DYNAMIC_DRAW);
+      
+      gl.bindTexture(gl.TEXTURE_2D, program.texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB,  pc.colorMapSize, 1, 0, gl.RGB, gl.UNSIGNED_BYTE,
+            pc.colorMapBytes);
+  }
+
+  function decompressPointCloud(pc) {
+        var huffmanOctree = base64Decode(pc.encodedOctree);
+        var encodedOctree = huffmanDecode(pc.huffmanCodes, huffmanOctree);
+        var vertData = getPointCloudFromEncodedOctree(encodedOctree);
+        var quantizedPoints = vertData.points.map(x => Math.round(65535*x));
+        return {
+            bbox : pc.bbox,
+            centroid : pc.centroid,
+            numVerts : pc.numVerts,
+            vertShorts : new Uint16Array(quantizedPoints),
+            colorMapSize : pc.colorMapSize,
+            colorMapBytes : new Uint8Array(pc.colorMap),
+            colorIndexBytes : new Uint8Array(vertData.colorIndices)
+        };
+  }
+
+  function smoothedCentroids(pcs) {
+        var N = pcs.length;
+        const R = 3;
+        var centroids = new Array(N); 
+        for (let i = 0; i < N; i++) {
+            var a = Math.max(0,i-R);
+            var b = Math.min(N-1,i+R);
+            var n = b - a + 1;
+            var sum = [0,0,0];
+            for (let k = a; k <= b; k++) {
+                sum[0] += pcs[k].centroid[0];
+                sum[1] += pcs[k].centroid[1];
+                sum[2] += pcs[k].centroid[2];
+            }
+            centroids[i] = [sum[0]/n, sum[1]/n, sum[2]/n]
+        }
+        return centroids;
+  }
+
+  function loadSelectedPointCloud(dropdown) {
+      var index = dropdown.value;
+      if (0 <= index && index < pointclouds.length) {
+            var pc = pointclouds[index];
+            if (pc) {
+                pointcloud = pc;
+                loadPointCloudGLBuffers(pointcloud);
+		        if (!frame)
+			        frame = requestAnimationFrame(display);
+            }
+      }
+  }
+
+  function loadPointClouds(count, onDoneLoading) {
+        pointclouds = new Array(count);
+        var pad = function(n, width, z) { // http://bit.ly/2JnzxLQ
+            z = z || '0';
+            n = n + '';
+            return n.length >= width ? n : new Array(width - n.length + 1).join(z) + n;
+        }
+        var num = 0;
+        var progressbar = document.getElementById("loadprogress");
+        progressbar.value = 0;
+        for (let i = 0; i < count; i++) {
+            // compress/pc-9-019.json
+            var fname = "compress/pc-9-" + pad(i,3) + ".json";
+            loadJSON(fname, function(response) {
+                var xpc = JSON.parse(response);
+                var pc = decompressPointCloud(xpc);
+                pointclouds[i] = pc;
+                // XXX console.log("got point cloud " + i + "...");
+                ++num;
+                var progress = Math.round(num*100/count);
+                progressbar.value = progress;
+                if (num >= count) {
+                    onDoneLoading();
+                }
+            });
+        }
+  }
+
+  function getAllPointCloudsAndAnimate(button) {
+      button.disabled = true;
+      // XXX console.log("getAllPointCloudsAndAnimate");
+      loadPointClouds(150, function() {
+            // XXX console.log("All point clouds loaded");
+            animate();
+      });
+  }
+
+  function lerp(t, p0, p1) {
+        var n = p0.length;
+        var p = new Array(n);
+        for (let i = 0; i < n; i++)
+                p[i] = p0[i]*(1 - t) + p1[i]*t;
+        return p;
+  }
+
+  function bboxCenter(bbox) {
+    return {
+        x : (bbox.min[0] + bbox.max[0])/2,
+        y : (bbox.min[1] + bbox.max[1])/2,
+        z : (bbox.min[2] + bbox.max[2])/2
+    };
+  }
+
+  var cameraLookatPath = null;
+
+  var fps = 30;
+  var fpsInterval = 1000 / fps;
+  var frameIndex = 0;
+  var then;
+  var lookatStart, lookatEnd;
+
+  function animate() {
+      requestAnimationFrame(animate);
+      if (cameraLookatPath === null)
+            cameraLookatPath = smoothedCentroids(pointclouds);
+      var now = Date.now();
+      if (then === undefined)
+            then = now;
+      var elapsed = now - then;
+      if (elapsed > fpsInterval) {
+            then = now - (elapsed % fpsInterval);
+            frameIndex = (frameIndex + 1) % pointclouds.length;
+            pointcloud = pointclouds[frameIndex];
+            loadPointCloudGLBuffers(pointcloud);
+            var lookat = cameraLookatPath[frameIndex];
+            camera.lookat = {
+                x : lookat[0],
+                y : lookat[1],
+                z : lookat[2]
+            };
+            // sphere = {
+            //     x : lookat[0], 
+            //     y : lookat[1], 
+            //     z : lookat[2]
+            // };
+           if (!frame)
+		        frame = requestAnimationFrame(display);   
+      }
+  }
+
+</script>
+
+</head>
+<body onload="init(); display()">
+
+<h1>Demo WebGL Point Cloud Renderer</h1>
+
+Click/touch and drag to rotate...<br />
+<canvas id="myCanvas" width="600" height="600"></canvas><br />
+
+Point Size:
+<select id="pointsize" onchange="changePointSize(this)">
+  <option value=""></option>
+  <option value="1.0">1.0</option>
+  <option value="2.0">2.0</option>
+  <option value="3.0">3.0</option>
+  <option value="4.0">4.0</option>
+  <option value="5.0">5.0</option>
+  <option value="6.0">6.0</option>
+  <option value="7.0">7.0</option>
+</select>
+
+<input type="checkbox" onchange="toggleShadow(this)">Shadows</input>
+<input type="checkbox" onchange="toggleReflection(this)" checked>Reflections</input>
+<br/>
+
+<button onclick="getAllPointCloudsAndAnimate(this)">Load Point Clouds and Animate</button>
+<progress id="loadprogress" value="00" max="100">10 %</progress>
+
+<hr>
+<footer>
+  All code and data is a property of Intel.<br />
+  Wayne O. Cochran<br />
+  <i>wayne.cochran@intel.com</i><br/>
+  September 3, 2019
+</footer>
+
+</body>
+</html>
