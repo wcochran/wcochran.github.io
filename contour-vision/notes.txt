@@ -1,0 +1,6 @@
+
+Using WebXR polyfill
+https://github.com/immersive-web/webxr-polyfill
+
+WebXR template
+https://github.com/immersive-web/webxr-samples/blob/main/ar-barebones.html
