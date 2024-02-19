@@ -115,7 +115,7 @@
               let pose = xrFrame.getViewerPose(xrReferenceSpace);
               if (pose) {
                   // Run imaginary 3D engine's simulation to step forward physics, animations, etc.
-                  scene.updateScene(timestamp, xrFrame);
+                  updateScene(timestamp, xrFrame);
                   
                   gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
                   
@@ -214,6 +214,10 @@
 	      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeLines, gl.STATIC_DRAW);
 
           return true;
+      }
+
+      function updateScene(timestamp, xrFrame) {
+         // XXX
       }
 
       // Get a view matrix and projection matrix appropriate for passing directly to a WebGL shader.
