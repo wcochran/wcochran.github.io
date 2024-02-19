@@ -127,6 +127,26 @@
               }
               // Request the next animation callback
               xrSession.requestAnimationFrame(onDrawFrame);
+
+              xrSession.addEventListener('visibilitychange', xrSessionEvent => {
+                  switch (xrSessionEvent.session.visibilityState) {
+                  case 'visible':
+                      resumeMedia();
+                      break;
+                  case 'visible-blurred':
+                      pauseMedia();
+                      // Allow the render loop to keep running, but just keep rendering the last
+                      // frame. Render loop may not run at full framerate.
+                      break;
+                  case 'hidden':
+                      pauseMedia();
+                      break;
+                  }
+              });
+
+              
+              xrSession.addEventListener('end', onSessionEnd);
+              
           } else {
               // No session available, so render a default mono view.
               gl.viewport(0, 0, glCanvas.width, glCanvas.height);
@@ -265,21 +285,11 @@
           gl.drawElements(gl.LINES, 2*12, gl.UNSIGNED_SHORT, 0);
       }
 
-      xrSession.addEventListener('visibilitychange', xrSessionEvent => {
-          switch (xrSessionEvent.session.visibilityState) {
-          case 'visible':
-              resumeMedia();
-              break;
-          case 'visible-blurred':
-              pauseMedia();
-              // Allow the render loop to keep running, but just keep rendering the last
-              // frame. Render loop may not run at full framerate.
-              break;
-          case 'hidden':
-              pauseMedia();
-              break;
-          }
-      });
+      function resumeMedia() {
+      }
+
+      function pauseMedia() {
+      }
 
       function endXRSession() {
           // Do we have an active session?
@@ -301,8 +311,6 @@
           window.requestAnimationFrame(onDrawFrame);
       }
 
-      xrSession.addEventListener('end', onSessionEnd);
-      
       checkForXRSupport();
     </script>
   </body>
