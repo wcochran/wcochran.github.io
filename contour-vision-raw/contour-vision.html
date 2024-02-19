@@ -9,7 +9,7 @@
 
   <body>
     <h1>Contour Vision (RAW)</h1>
-    <button id="xr-button">XR not found</button>
+    <!-- <button id="xr-button">XR not found</button> --?
     <script src='webxr-polyfill.js'></script>
     <script>
       var polyfill = new WebXRPolyfill();
@@ -22,10 +22,10 @@
           navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
               if (supported) {
                   console.log("Immersive VR sessions IS supported.");
-                  // var enterXrBtn = document.createElement("button");
-                  // enterXrBtn.innerHTML = "Enter VR";
-                  // enterXrBtn.addEventListener("click", beginXRSession);
-                  // document.body.appendChild(enterXrBtn);
+                  var enterXrBtn = document.createElement("button");
+                  enterXrBtn.innerHTML = "Enter VR";
+                  enterXrBtn.addEventListener("click", beginXRSession);
+                  document.body.appendChild(enterXrBtn);
               } else {
                   console.log("Immersive VR sessions IS NOT supported.");
               }
