@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+  
+  <head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'>
+    <title>Contour Vision (RAW)</title>
+  </head>
+
+  <body>
+    <h1>Contour Vision (RAW)</h1>
+    <button id="xr-button">XR not found</button>
+    <script src='webxr-polyfill.js'></script>
+    <script>
+      var polyfill = new WebXRPolyfill();
+
+      async function checkForXRSupport() {
+          // Check to see if there is an XR device available that supports immersive VR
+          // presentation (for example: displaying in a headset). If the device has that
+          // capability the page will want to add an "Enter VR" button to the page (similar to
+          // a "Fullscreen" button) that starts the display of immersive VR content.
+          navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+              if (supported) {
+                  console.log("Immersive VR sessions IS supported.");
+                  // var enterXrBtn = document.createElement("button");
+                  // enterXrBtn.innerHTML = "Enter VR";
+                  // enterXrBtn.addEventListener("click", beginXRSession);
+                  // document.body.appendChild(enterXrBtn);
+              } else {
+                  console.log("Immersive VR sessions IS NOT supported.");
+              }
+          });
+      }
+
+      checkForXRSupport();
+    </script>
+  </body>
+  
+</html>
+    
