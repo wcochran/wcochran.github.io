@@ -281,7 +281,7 @@
           const PVM = matrixMultiply(PV, modelMatrix);
           gl.uniformMatrix4fv(program.ModelViewProjection, false, PVM);
 
-          gl.bindBuffer(gl.ARRAY_BUFFER, program.cubeVertBuffer);
+          gl.bindBuffer(gl.ARRAY_BUFFER, program.cubeVertexBuffer);
           gl.enableVertexAttribArray(program.vertexPosition);
           gl.vertexAttribPointer(program.vertexPosition, 3, gl.FLOAT, false, 0, 0);
 
