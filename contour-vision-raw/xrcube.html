@@ -144,8 +144,10 @@
                   updateScene(timestamp, xrFrame);
                   
                   gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
-                  gl.clearColor(0.4,0.4,0.4,1);
-                  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                  if (xrFlavor != 'immersive-ar') {
+                      gl.clearColor(0.4,0.4,0.4,1);
+                      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                  }
                   
                   for (let view of pose.views) {
                       let viewport = glLayer.getViewport(view);
