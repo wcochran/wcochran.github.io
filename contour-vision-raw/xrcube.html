@@ -280,7 +280,7 @@
 
       function drawSceneWithCameraData(viewMatrix, projectionMatrix) {
           let R = rotation4x4(scene.angle, 0,1,0);
-          let T = translate4x4(0, 0, -2.5); // place cube 2.5 m in front of eye
+          let T = translate4x4(0, 0, -3.5); // place cube 2.5 m in front of eye
           let modelMatrix = multiply4x4(T,R);
 
           const PV = multiply4x4(projectionMatrix, viewMatrix);
