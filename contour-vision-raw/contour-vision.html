@@ -243,7 +243,7 @@
           
           const fovy = fovy_degrees * Math.PI/180;
           const f = 1/Math.tan(fovy/2);
-          const s = 1/(zNeat - zFar);
+          const s = 1/(zNear - zFar);
           let projectionMatrix = Float32Array([
               f/aspect, 0, 0, 0,
               0, f, 0, 0,
