@@ -28,35 +28,56 @@
     <h1>WebXR Cube</h1>
     <script src='webxr-polyfill.js'></script>
     <script>
+      // https://github.com/immersive-web/webxr/blob/main/explainer.md
+      // https://github.com/immersive-web/webxr-polyfill
       var polyfill = new WebXRPolyfill();
+
+      let glCanvas = document.createElement("canvas");
+      let gl = glCanvas.getContext("webgl");
+      loadSceneGraphics(gl);
 
       async function checkForXRSupport() {
           // Check to see if there is an XR device available that supports immersive VR
           // presentation (for example: displaying in a headset). If the device has that
-          // capability the page will want to add an "Enter VR" button to the page (similar to
+          // capability the page will want to add an "Enter AR" button to the page (similar to
           // a "Fullscreen" button) that starts the display of immersive VR content.
           navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
               if (supported) {
-                  console.log("Immersive VR sessions IS supported.");
+                  console.log("Immersive AR sessions IS supported.");
                   var enterXrBtn = document.createElement("button");
-                  enterXrBtn.innerHTML = "Enter VR";
+                  enterXrBtn.innerHTML = "Enter AR";
                   enterXrBtn.addEventListener("click", beginXRSession);
                   document.body.appendChild(enterXrBtn);
               } else {
-                  console.log("Immersive VR sessions IS NOT supported.");
+                  console.log("Immersive AR sessions IS NOT supported.");
+                  beginNonXRExperience();
               }
           });
       }
 
+      function beginNonXRExperience() {
+          const labelDiv = document.createElement('div');
+          labelDiv.textContent = "Non Immersive AR Experience \uD83D\uDE1E";
+          labelDiv.id = "no-ar-label";
+          labelDiv.style.fontSize = '18px';
+          labelDiv.style.color = 'blue';
+          document.body.appendChild(labelDiv);
+          
+          glCanvas.width = 800;
+          glCanvas.height = 500;
+          glCanvas.id = "gl-canvas";
+          glCanvas.style.border = '1px solid #000';
+          document.body.appendChild(glCanvas);
+          window.requestAnimationFrame(onDrawFrame);
+      }
+
       function beginXRSession() {
-          // requestSession must be called within a user gesture event
-          // like click or touch when requesting an immersive session.
           navigator.xr.requestSession('immersive-ar')
               .then(onSessionStarted)
               .catch(err => {
                   // May fail for a variety of reasons. Probably just want to
                   // render the scene normally without any tracking at this point.
-                  window.requestAnimationFrame(onDrawFrame);
+                  beginNonXRExperience();
               });
       }
 
@@ -77,14 +98,6 @@
                   xrSession.requestAnimationFrame(onDrawFrame);
               });
       }
-
-      let glCanvas = document.createElement("canvas");
-      let gl = glCanvas.getContext("webgl");
-      loadSceneGraphics(gl);
-
-      // alernative to calling gl.makeXRCompatible()
-      // let gl = glCanvas.getContext("webgl", { xrCompatible: true });
-      // loadSceneGraphics(gl);
 
       function setupWebGLLayer() {
           // Make sure the canvas context we want to use is compatible with the current xr device.
@@ -143,12 +156,15 @@
                   }
               });
 
-              
               xrSession.addEventListener('end', onSessionEnd);
               
           } else {
               // No session available, so render a default mono view.
               gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+              gl.clearColor(0.4,0.4,0.4,1);
+              gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+              gl.enable(gl.DEPTH_TEST);
+              
               drawSceneFromDefaultView();
               
               // Request the next window callback
@@ -225,7 +241,7 @@
       }
 
       function drawSceneFromDefaultView() {
-          let viewMatrix = Float32Array([
+          let viewMatrix = new Float32Array([
               1,0,0,0,
               0,1,0,0,
               0,0,1,0,
@@ -236,12 +252,12 @@
           const canvasAspect = glCanvas.width / glCanvas.height;
           const aspect = canvasAspect;
           const zNear = 0.1;
-          const zVar = 10.0;
+          const zFar = 10.0;
           
           const fovy = fovy_degrees * Math.PI/180;
           const f = 1/Math.tan(fovy/2);
           const s = 1/(zNear - zFar);
-          let projectionMatrix = Float32Array([
+          let projectionMatrix = new Float32Array([
               f/aspect, 0, 0, 0,
               0, f, 0, 0,
               0, 0, (zFar + zNear)*s, -1,
@@ -251,7 +267,6 @@
           drawSceneWithCameraData(viewMatrix, projectionMatrix);
       }
 
-      // Get a view matrix and projection matrix appropriate for passing directly to a WebGL shader.
       function drawSceneWithCameraData(viewMatrix, projectionMatrix) {
 
           function matrixMultiply(A, B) {
