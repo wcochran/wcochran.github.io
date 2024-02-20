@@ -4,7 +4,7 @@
   <head>
     <meta charset='utf-8'>
     <meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'>
-    <title>Contour Vision (RAW)</title>
+    <title>WebXR Cube</title>
   </head>
   
   <script id="vertex" type="x-shader">
@@ -25,8 +25,7 @@
   </script>
 
   <body>
-    <h1>Contour Vision (RAW)</h1>
-    <!-- <button id="xr-button">XR not found</button> -->
+    <h1>WebXR Cube</h1>
     <script src='webxr-polyfill.js'></script>
     <script>
       var polyfill = new WebXRPolyfill();
@@ -36,7 +35,7 @@
           // presentation (for example: displaying in a headset). If the device has that
           // capability the page will want to add an "Enter VR" button to the page (similar to
           // a "Fullscreen" button) that starts the display of immersive VR content.
-          navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
               if (supported) {
                   console.log("Immersive VR sessions IS supported.");
                   var enterXrBtn = document.createElement("button");
@@ -52,7 +51,7 @@
       function beginXRSession() {
           // requestSession must be called within a user gesture event
           // like click or touch when requesting an immersive session.
-          navigator.xr.requestSession('immersive-vr')
+          navigator.xr.requestSession('immersive-ar')
               .then(onSessionStarted)
               .catch(err => {
                   // May fail for a variety of reasons. Probably just want to
