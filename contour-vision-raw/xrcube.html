@@ -36,21 +36,35 @@
       let gl = glCanvas.getContext("webgl");
       loadSceneGraphics(gl);
 
+      var xrFlavor = "none";
+
       async function checkForXRSupport() {
           // Check to see if there is an XR device available that supports immersive VR
           // presentation (for example: displaying in a headset). If the device has that
           // capability the page will want to add an "Enter AR" button to the page (similar to
           // a "Fullscreen" button) that starts the display of immersive VR content.
-          navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
               if (supported) {
                   console.log("Immersive AR sessions IS supported.");
+                  xrFlavor = 'immersive-ar';
                   var enterXrBtn = document.createElement("button");
                   enterXrBtn.innerHTML = "Enter AR";
                   enterXrBtn.addEventListener("click", beginXRSession);
                   document.body.appendChild(enterXrBtn);
               } else {
-                  console.log("Immersive AR sessions IS NOT supported.");
-                  beginNonXRExperience();
+                  navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+                      if (supported) {
+                          console.log("Immersive VR sessions IS supported.");
+                          var enterXrBtn = document.createElement("button");
+                          xrFlavor = 'immersive-vr';
+                          enterXrBtn.innerHTML = "Enter VR";
+                          enterXrBtn.addEventListener("click", beginXRSession);
+                          document.body.appendChild(enterXrBtn);
+                      } else {
+                          console.log("Immersive XR sessions IS NOT supported.");
+                          beginNonXRExperience();
+                      }
+                  });
               }
           });
       }
@@ -72,7 +86,7 @@
       }
 
       function beginXRSession() {
-          navigator.xr.requestSession('immersive-vr')
+          navigator.xr.requestSession(xrFlavor)
               .then(onSessionStarted)
               .catch(err => {
                   // May fail for a variety of reasons. Probably just want to
