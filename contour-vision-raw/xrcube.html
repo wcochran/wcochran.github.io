@@ -41,7 +41,7 @@
           // presentation (for example: displaying in a headset). If the device has that
           // capability the page will want to add an "Enter AR" button to the page (similar to
           // a "Fullscreen" button) that starts the display of immersive VR content.
-          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+          navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
               if (supported) {
                   console.log("Immersive AR sessions IS supported.");
                   var enterXrBtn = document.createElement("button");
@@ -72,7 +72,7 @@
       }
 
       function beginXRSession() {
-          navigator.xr.requestSession('immersive-ar')
+          navigator.xr.requestSession('immersive-vr')
               .then(onSessionStarted)
               .catch(err => {
                   // May fail for a variety of reasons. Probably just want to
