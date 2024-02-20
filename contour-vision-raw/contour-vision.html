@@ -235,7 +235,7 @@
 
           const fovy_degrees = 90;
           const canvasAspect = glCanvas.width / glCanvas.height;
-          const aspect = canvasAspect; // XXXX 1.0; // XXX
+          const aspect = canvasAspect;
           const zNear = 0.1;
           const zVar = 10.0;
           
@@ -272,8 +272,8 @@
           let modelMatrix = new Float32Array([
               1, 0,    0, 0,
               0, 1,    0, 0,
-              0, 0, -2.5, 0,   // place cube 2.5 m in front of eye
-              0, 0,    0, 1
+              0, 0,    0, 0,
+              0, 0, -2.5, 1     // place cube 2.5 m in front of eye
           ]);
 
           const PVM = matrixMultiply(PV, modelMatrix);
