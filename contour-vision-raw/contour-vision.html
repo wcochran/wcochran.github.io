@@ -271,7 +271,7 @@
 
           const PV = matrixMultiply(projectionMatrix, viewMatrix);
 
-          let modelMatrix = Float32Array([
+          let modelMatrix = new Float32Array([
               1, 0,    0, 0,
               0, 1,    0, 0,
               0, 0, -2.5, 0,   // place cube 2.5 m in front of eye
