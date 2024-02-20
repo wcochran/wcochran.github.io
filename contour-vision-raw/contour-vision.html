@@ -166,7 +166,7 @@
           gl.compileShader(vs);
           if (!gl.getShaderParameter(vs,gl.COMPILE_STATUS)) {
               alert(gl.getShaderInfoLog(vs));
-              return false; 
+              return; 
           }
 
           var f = document.getElementById("fragment").firstChild.nodeValue;
@@ -175,7 +175,7 @@
           gl.compileShader(fs);
           if (!gl.getShaderParameter(fs,gl.COMPILE_STATUS)) {
               alert(gl.getShaderInfoLog(fs));
-              return false;
+              return;
           }
 
           program = gl.createProgram();
@@ -212,8 +212,6 @@
           program.cubeLineBuffer = gl.createBuffer();
  	      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, program.cubeLineBuffer);
 	      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeLines, gl.STATIC_DRAW);
-
-          return true;
       }
 
       function updateScene(timestamp, xrFrame) {
@@ -263,7 +261,7 @@
                   for (let c = 0; c < 4; c++) {
                       let v = 0;
                       for (let i = 0; i < 4; i++)
-                          v += A[r + 4*i] * B[i + r*c];
+                          v += A[r + 4*i] * B[i + 4*c];
                       AB[r + 4*c] = v;
                   }
               return AB;
