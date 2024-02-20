@@ -27,6 +27,7 @@
   <body>
     <h1>WebXR Cube</h1>
     <script src='webxr-polyfill.js'></script>
+    <script src='math-junkdrawer.js'></script>
     <script>
       // https://github.com/immersive-web/webxr/blob/main/explainer.md
       // https://github.com/immersive-web/webxr-polyfill
@@ -177,6 +178,8 @@
               xrSession.addEventListener('end', onSessionEnd);
               
           } else {
+              updateScene(timestamp, xrFrame);
+
               // No session available, so render a default mono view.
               gl.viewport(0, 0, glCanvas.width, glCanvas.height);
               gl.clearColor(0.4,0.4,0.4,1);
@@ -247,8 +250,12 @@
 	      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeLines, gl.STATIC_DRAW);
       }
 
+      var scene = { angle : 0.0 };
+
       function updateScene(timestamp, xrFrame) {
-         // XXX
+          const t = timestamp / 1000;
+          const degreesPerSecond = 20.0;
+          scene.angle = t*  degreesPerSecond;
       }
 
       // Get a view matrix and projection matrix appropriate for passing directly to a WebGL shader.
@@ -259,56 +266,25 @@
       }
 
       function drawSceneFromDefaultView() {
-          let viewMatrix = new Float32Array([
-              1,0,0,0,
-              0,1,0,0,
-              0,0,1,0,
-              0,0,0,1
-          ]);
+          let viewMatrix = identity4x4();
 
           const fovy_degrees = 90;
           const canvasAspect = glCanvas.width / glCanvas.height;
           const aspect = canvasAspect;
           const zNear = 0.1;
           const zFar = 10.0;
-          
-          const fovy = fovy_degrees * Math.PI/180;
-          const f = 1/Math.tan(fovy/2);
-          const s = 1/(zNear - zFar);
-          let projectionMatrix = new Float32Array([
-              f/aspect, 0, 0, 0,
-              0, f, 0, 0,
-              0, 0, (zFar + zNear)*s, -1,
-              0, 0, 2*zFar*zNear*s, 0
-          ]);
+          let projectionMatrix = perspective4x4(fovy_degrees, aspect, zNear, zFar);
 
           drawSceneWithCameraData(viewMatrix, projectionMatrix);
       }
 
       function drawSceneWithCameraData(viewMatrix, projectionMatrix) {
+          let R = rotation4x4(scene.angle, 0,1,0);
+          let T = translate4x4(0, 0, -2.5); // place cube 2.5 m in front of eye
+          let modelMatrix = multiply4x4(T,R);
 
-          function matrixMultiply(A, B) {
-              let AB = new Float32Array(16);
-              for (let r = 0; r < 4; r++)
-                  for (let c = 0; c < 4; c++) {
-                      let v = 0;
-                      for (let i = 0; i < 4; i++)
-                          v += A[r + 4*i] * B[i + 4*c];
-                      AB[r + 4*c] = v;
-                  }
-              return AB;
-          }
-
-          const PV = matrixMultiply(projectionMatrix, viewMatrix);
-
-          let modelMatrix = new Float32Array([
-              1, 0,    0, 0,
-              0, 1,    0, 0,
-              0, 0,    1, 0,
-              0, 0, -2.5, 1     // place cube 2.5 m in front of eye
-          ]);
-
-          const PVM = matrixMultiply(PV, modelMatrix);
+          const PV = multiply4x4(projectionMatrix, viewMatrix);
+          const PVM = multiply4x4(PV, modelMatrix);
           gl.uniformMatrix4fv(program.ModelViewProjection, false, PVM);
 
           gl.bindBuffer(gl.ARRAY_BUFFER, program.cubeVertexBuffer);
