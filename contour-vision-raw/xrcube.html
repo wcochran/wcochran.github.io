@@ -40,10 +40,7 @@
       var xrFlavor = "none";
 
       async function checkForXRSupport() {
-          // Check to see if there is an XR device available that supports immersive VR
-          // presentation (for example: displaying in a headset). If the device has that
-          // capability the page will want to add an "Enter AR" button to the page (similar to
-          // a "Fullscreen" button) that starts the display of immersive VR content.
+          // Check to see if there is an XR device available that supports AR OR VR.
           navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
               if (supported) {
                   console.log("Immersive AR sessions IS supported.");

@@ -102,3 +102,49 @@ Matrix4x4Stack.prototype.pop = function() {
     var C = this.stack.pop();
     return C;
 }
+
+function scale3(s, V) {
+    let U = Float32Array(3);
+    U[0] = s*V[0];
+    U[1] = s*V[1];
+    U[2] = s*V[2];
+    return U;
+}
+
+function identical3(U, V) {
+    return U[0] == V[0] && U[1] == V[1] && U[2] == V[2];
+}
+
+function sub3(U, V) {
+    let D = Float32Array(3);
+    D[0] = U[0] - V[0];
+    D[1] = U[1] - V[1];
+    D[2] = U[2] - V[2];
+    return D;
+}
+
+function add3(U, V) {
+    let S = Float32Array(3);
+    S[0] = U[0] + V[0];
+    S[1] = U[1] + V[1];
+    S[2] = U[2] + V[2];
+    return S;
+}
+
+function dot3(U, V) {
+    return U[0]*V[0] + U[1]*V[1] + U[2]*V[2];
+}
+
+function magSquared3(U) {
+    return dot3(U,U);
+}
+
+function mag3(U) {
+    return Math.sqrt(magSquared3(U));
+}
+
+function normalize3(U) {
+    let m = ma3(U);
+    let s = m > 0 ? 1/m : 1;
+    return scale3(s, U);
+}
