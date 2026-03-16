@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Stereo Video AR</title>
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #111; }
+
+    #overlay {
+      position: fixed; inset: 0; display: flex;
+      flex-direction: column; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.88); color: #fff;
+      font-family: system-ui, sans-serif; z-index: 10;
+    }
+    #overlay h1 { margin: 0 0 0.4em; font-size: 1.3em; font-weight: 600; }
+    #overlay p  { margin: 0 0 1.4em; font-size: 0.9em; color: #aaa; text-align: center; max-width: 320px; }
+
+    #enter-ar {
+      padding: 14px 36px; font-size: 1.05em; font-weight: 600;
+      background: #0070f3; color: #fff; border: none;
+      border-radius: 10px; cursor: pointer; letter-spacing: 0.02em;
+    }
+    #enter-ar:disabled { background: #444; cursor: default; }
+
+    #status { margin-top: 1em; font-size: 0.8em; color: #777; }
+
+    /* Exit button shown via dom-overlay inside AR */
+    #ar-overlay {
+      position: fixed; top: 16px; right: 16px; z-index: 9999;
+    }
+    #exit-ar {
+      padding: 8px 18px; background: rgba(0,0,0,0.55); color: #fff;
+      border: 1px solid rgba(255,255,255,0.5); border-radius: 8px;
+      font-size: 0.95em; cursor: pointer; display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <!--
+    dom-overlay element: HTML drawn on top of the AR camera feed.
+    Pass its id to the webxr component below.
+  -->
+  <div id="ar-overlay">
+    <button id="exit-ar">Exit AR</button>
+  </div>
+
+  <!-- Video lives outside <a-assets> so A-Frame doesn't block scene init on it -->
+  <video
+    id="video"
+    src="https://streams.quintar.ai/nfl-2025/20251207-LAR-ARI/clip1-sync1-waynereg3-fullframe.mp4"
+    crossorigin="anonymous"
+    loop
+    muted
+    playsinline
+    webkit-playsinline
+    preload="metadata"
+    style="display:none"
+  ></video>
+
+  <a-scene
+    id="scene"
+    field-tracker
+    webxr="requiredFeatures: local;
+           optionalFeatures: local-floor, dom-overlay, bounded-floor, hand-tracking;
+           overlayElement: #ar-overlay"
+    renderer="colorManagement: true; alpha: true; antialias: true"
+    background="color: transparent; transparent: true"
+    vr-mode-ui="enabled: false"
+  >
+
+    <!-- Stereo quad — placed once in world space when AR starts, then stays fixed -->
+    <a-entity id="stereo-quad"></a-entity>
+
+    <!--
+      Field contour preview — 1 ft = 5 mm scale, centred in front of viewer.
+      field X (long ±186 ft) → Three.js X  (horizontal)
+      field Y (wide ±80 ft)  → Three.js Y  (vertical)
+      field Z (height 0-45)  → Three.js Z  (goal posts toward viewer)
+    -->
+  </a-scene>
+
+  <div id="overlay">
+    <h1>Stereo Video AR</h1>
+    <p>Places a stereo top/bottom video on a quad in your environment via passthrough AR.</p>
+    <button id="enter-ar" disabled>Checking XR support…</button>
+    <div id="status">Loading…</div>
+  </div>
+
+  <script>
+    // ─── Stereo Top/Bottom Video Component ───────────────────────────────────
+    //
+    // Renders the top half of a top/bottom stereo video to the left eye and
+    // the bottom half to the right eye, using a custom GLSL shader whose
+    // `eye` uniform (0=left, 1=right) is updated in onBeforeRender.
+    //
+    // URL param ?swap  — swaps left/right eye mapping (try if eyes are reversed)
+    //
+    AFRAME.registerComponent('stereo-tb', {
+      schema: {
+        src:    { type: 'string', default: '#video' },
+        width:  { type: 'number', default: 3.0 },
+        height: { type: 'number', default: 0 }   // 0 = auto-fit from video aspect ratio
+      },
+
+      init: function () {
+        const params = new URLSearchParams(location.search);
+        this.swapEyes = params.has('swap');
+
+        const video = document.querySelector(this.data.src);
+        if (!video) { console.error('[stereo-tb] element not found:', this.data.src); return; }
+        this.video = video;
+
+        // VideoTexture — Three.js flips Y by default so:
+        //   UV y=1  →  top    of video frame  (left-eye content in T/B stereo)
+        //   UV y=0  →  bottom of video frame  (right-eye content in T/B stereo)
+        const texture = new THREE.VideoTexture(video);
+        // Plain bilinear — no mip chain regenerated every frame, no inter-mip blurring.
+        // The screen fills most of the FOV so trilinear mipmapping buys little and
+        // adds blur. Anisotropic filtering sharpens the slightly pitched surface.
+        texture.generateMipmaps = false;
+        texture.minFilter = THREE.LinearFilter;
+        texture.magFilter = THREE.LinearFilter;
+        texture.anisotropy = this.el.sceneEl.renderer.capabilities.getMaxAnisotropy();
+        this.texture = texture;
+
+        // Alpha mask — same stereo T/B layout as the video.
+        // Black pixels (r=0) → alpha=0 → XR compositor shows passthrough camera feed.
+        // White pixels (r=1) → alpha=1 → video is fully opaque.
+        const maskTexture = new THREE.TextureLoader().load('cardinals_mask.png');
+        maskTexture.generateMipmaps = false;
+        maskTexture.minFilter = THREE.LinearFilter;
+        maskTexture.magFilter = THREE.LinearFilter;
+        maskTexture.colorSpace = THREE.NoColorSpace; // raw linear data — no sRGB gamma lift
+        this.maskTexture = maskTexture;
+
+        // Shader remaps the full-quad UV [0,1] to the appropriate half-frame:
+        //   left eye  (eye=0): y' = y*0.5 + 0.5  →  upper half of texture
+        //   right eye (eye=1): y' = y*0.5 + 0.0  →  lower half of texture
+        this.material = new THREE.ShaderMaterial({
+          uniforms: {
+            map:  { value: texture },
+            mask: { value: maskTexture },
+            eye:  { value: 0.0 }
+          },
+          vertexShader: /* glsl */`
+            varying vec2 vUv;
+            void main() {
+              vUv = uv;
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+          `,
+          fragmentShader: /* glsl */`
+            uniform sampler2D map;
+            uniform sampler2D mask;
+            uniform float eye;   // 0 = left, 1 = right
+            varying vec2 vUv;
+            void main() {
+              float yOff = (1.0 - eye) * 0.5;
+              vec2 uv = vec2(vUv.x, vUv.y * 0.5 + yOff);
+              vec4 color = texture2D(map, uv);
+              // Red channel of mask drives alpha: black=transparent (passthrough),
+              // white=opaque (video visible).  XR compositor uses alpha to composite
+              // rendered content over the camera feed.
+              float alpha = texture2D(mask, uv).r;
+              gl_FragColor = vec4(color.rgb, alpha);
+            }
+          `,
+          transparent: true,   // enable alpha blending so XR compositor sees alpha=0 as passthrough
+          depthWrite: false,
+          side: THREE.DoubleSide
+        });
+
+        // Placeholder geometry — corrected once video dimensions are known
+        this.mesh = new THREE.Mesh(
+          new THREE.PlaneGeometry(this.data.width, this.data.width * (9.0/32.0)),
+          this.material
+        );
+
+        const self = this;
+        this.mesh.onBeforeRender = function (renderer, _scene, camera) {
+          const xrCam = renderer.xr.getCamera();
+          let eyeIdx = 0; // default: mono → left-eye half
+          if (xrCam && xrCam.cameras && xrCam.cameras.length >= 2) {
+            eyeIdx = (camera === xrCam.cameras[0]) ? 0 : 1;
+          }
+          if (self.swapEyes) eyeIdx = 1 - eyeIdx;
+          self.material.uniforms.eye.value = eyeIdx;
+        };
+
+        // Disable frustum culling — the placed quad can easily be outside the
+        // default bounding-sphere estimate, especially after world placement.
+        this.mesh.frustumCulled = false;
+
+        // Render first (before field contours) and clear depth afterward so
+        // field geometry is never occluded by the video screen.
+        this.mesh.renderOrder = 0;
+        this.mesh.onAfterRender = function(renderer) { renderer.clearDepth(); };
+
+        this.el.setObject3D('mesh', this.mesh);
+
+        // Adjust quad aspect ratio once metadata is loaded
+        if (video.readyState >= 1) {
+          this._fitToVideo();
+        } else {
+          video.addEventListener('loadedmetadata', () => this._fitToVideo());
+        }
+      },
+
+      _fitToVideo: function () {
+        // If explicit height was provided via registration data, use it directly.
+        if (this.data.height > 0) {
+          const width  = this.data.width;
+          const height = this.data.height;
+          this.mesh.geometry.dispose();
+          this.mesh.geometry = new THREE.PlaneGeometry(width, height);
+          console.log(`[stereo-tb] registration-sized quad ${width.toFixed(4)}×${height.toFixed(4)} m`);
+          return;
+        }
+        // Otherwise infer height from the video's pixel dimensions.
+        const { videoWidth: w, videoHeight: h } = this.video;
+        if (!w || !h) return;
+        // Per-eye aspect = full width ÷ half height (top/bottom stereo)
+        const aspect = w / (h / 2);
+        const width  = this.data.width;
+        const height = width / aspect;
+        this.mesh.geometry.dispose();
+        this.mesh.geometry = new THREE.PlaneGeometry(width, height);
+        console.log(`[stereo-tb] video ${w}×${h} → per-eye aspect ${aspect.toFixed(3)} → quad ${width.toFixed(4)}×${height.toFixed(4)} m`);
+      },
+
+      remove: function () {
+        if (this.texture)  this.texture.dispose();
+        if (this.material) this.material.dispose();
+        if (this.mesh)     this.mesh.geometry.dispose();
+        this.el.removeObject3D('mesh');
+      }
+    });
+
+    // ─── Per-frame WASM update ────────────────────────────────────────────────
+    //
+    // Delegates all per-eye field-transform computation (z-shear warp, billboard,
+    // height-follow) to the spatial_math WASM module and applies the results to
+    // the Three.js scene graph.
+    //
+    function updateFromWasm() {
+      if (!spatialMath || !wasmFieldReady || !leftFieldMesh || !rightFieldMesh) return;
+      const xrCam = scene.renderer.xr.getCamera();
+      if (!xrCam || !xrCam.cameras || xrCam.cameras.length < 2) return;
+
+      // Each matrixWorld.elements is already a Float32Array (column-major, 16 floats).
+      const result = spatialMath.update(
+        xrCam.cameras[0].matrixWorld.elements,
+        xrCam.cameras[1].matrixWorld.elements,
+        xrCam.matrixWorld.elements
+      );
+
+      // result[0..16]  — left-eye  M4 (column-major)
+      leftFieldMesh.matrix.fromArray(result, 0);
+      leftFieldMesh.matrixWorldNeedsUpdate = true;
+
+      // result[16..32] — right-eye M4 (column-major)
+      rightFieldMesh.matrix.fromArray(result, 16);
+      rightFieldMesh.matrixWorldNeedsUpdate = true;
+
+      // result[32..35] — screen position  (updated by height-follow / billboard)
+      // result[35..39] — screen quaternion (updated by billboard)
+      quad.object3D.position.set(result[32], result[33], result[34]);
+      quad.object3D.quaternion.set(result[35], result[36], result[37], result[38]);
+    }
+
+    AFRAME.registerComponent('field-tracker', {
+      tick: function () { updateFromWasm(); }
+    });
+
+    // ─── Extruded Tube Mesh — port of ExtrudedTubeMesh.kt ────────────────────
+    //
+    // Builds a tube mesh by extruding a circular cross-section along a polyline
+    // spine using the Double Reflection parallel-transport algorithm (no twist).
+    //
+    // Returns a THREE.BufferGeometry with position + normal attributes and index.
+    //
+
+    // Find a vector perpendicular to V (same logic as Kotlin companion object).
+    function _perpVector(v) {
+      const ax = Math.abs(v.x), ay = Math.abs(v.y), az = Math.abs(v.z);
+      if (ax <= ay && ax <= az) return new THREE.Vector3(0,   v.z, -v.y);
+      if (ay <= ax && ay <= az) return new THREE.Vector3(v.z, 0,   -v.x);
+      return new THREE.Vector3(v.y, -v.x, 0);
+    }
+
+    function buildExtrudedTubeMesh(spine, radius, turns, addEndCaps = true) {
+      const N         = spine.length;
+      const turnAngle = 2 * Math.PI / turns;
+
+      // Normalized direction vectors for each spine segment
+      const spineVec = new Array(N);
+      for (let i = 0; i < N - 1; i++)
+        spineVec[i] = spine[i+1].clone().sub(spine[i]).normalize();
+      spineVec[N-1] = spine[1].clone().sub(spine[0]).normalize();
+
+      // Tangent at each spine point = normalized average of adjacent segment dirs
+      const tangents = new Array(N);
+      tangents[0]   = spineVec[0].clone();
+      tangents[N-1] = spineVec[N-2].clone();
+      for (let i = 1; i < N - 1; i++)
+        tangents[i] = spineVec[i-1].clone().add(spineVec[i]).normalize();
+
+      const numCylVerts = N * (turns + 1);
+      const numCapVerts = addEndCaps ? 2 * turns : 0;
+      const numVerts    = numCylVerts + numCapVerts;
+      const positions   = new Float32Array(numVerts * 3);
+      const normals     = new Float32Array(numVerts * 3);
+
+      // Write one vertex into the flat arrays
+      function setVert(idx, px, py, pz, nx, ny, nz) {
+        positions[idx*3]   = px; positions[idx*3+1] = py; positions[idx*3+2] = pz;
+        normals[idx*3]     = nx; normals[idx*3+1]   = ny; normals[idx*3+2]   = nz;
+      }
+
+      // Generate one ring of cross-section vertices at spine point i.
+      // X = spine position, R/S = orthonormal frame vectors, spineV = segment dir.
+      function outputCrossSection(i, X, R, S, spineV) {
+        for (let j = 0; j <= turns; j++) {
+          const ti    = (j === turns) ? 0 : j;
+          const angle = ti * turnAngle;
+          const cosA  = Math.cos(angle), sinA = Math.sin(angle);
+          // D: point on unit circle in the cross-section plane
+          const Dx = S.x*cosA + R.x*sinA;
+          const Dy = S.y*cosA + R.y*sinA;
+          const Dz = S.z*cosA + R.z*sinA;
+          // Nv: D projected perpendicular to spine (for correct normals on bends)
+          const dot = Dx*spineV.x + Dy*spineV.y + Dz*spineV.z;
+          const Nvx = Dx - dot*spineV.x;
+          const Nvy = Dy - dot*spineV.y;
+          const Nvz = Dz - dot*spineV.z;
+          const m   = Math.sqrt(Nvx*Nvx + Nvy*Nvy + Nvz*Nvz);
+          const u   = radius / m;
+          const nm  = 1 / m;
+          setVert(i*(turns+1) + j,
+            X.x + Dx*u, X.y + Dy*u, X.z + Dz*u,
+            Nvx*nm, Nvy*nm, Nvz*nm);
+        }
+      }
+
+      // Bootstrap first frame and first cross-section
+      let X0 = spine[0].clone();
+      let T0 = tangents[0].clone();
+      let R0 = _perpVector(T0).normalize();
+      const S0 = T0.clone().cross(R0);
+      outputCrossSection(0, X0, R0, S0, spineVec[0]);
+
+      // Double Reflection Algorithm — propagates the frame with no twist
+      for (let i = 1; i < N; i++) {
+        const X1 = spine[i];
+        const V1 = X1.clone().sub(X0);
+        const c1 = V1.dot(V1);
+        // Reflect R0 and T0 across the plane perpendicular to V1
+        const RL = R0.clone().addScaledVector(V1, -2 * V1.dot(R0) / c1);
+        const TL = T0.clone().addScaledVector(V1, -2 * V1.dot(T0) / c1);
+        const T1 = tangents[i];
+        const V2 = T1.clone().sub(TL);
+        const c2 = V2.dot(V2);
+        // Reflect again to align with the new tangent
+        const R1 = c2 > 1e-10
+          ? RL.clone().addScaledVector(V2, -2 * V2.dot(RL) / c2)
+          : RL.clone();
+        const S1 = T1.clone().cross(R1);
+        outputCrossSection(i, X1, R1, S1, spineVec[i-1]);
+        X0 = X1.clone(); T0 = T1.clone(); R0 = R1.clone();
+      }
+
+      // End caps: replicate the first/last cross-section vertices with flat normals
+      let startCapIdx = 0, endCapIdx = 0;
+      if (addEndCaps) {
+        startCapIdx = numCylVerts;
+        const sn = spineVec[0];
+        for (let i = 0; i < turns; i++) {
+          const s = i * 3;
+          setVert(startCapIdx + i,
+            positions[s], positions[s+1], positions[s+2],
+            -sn.x, -sn.y, -sn.z);
+        }
+        endCapIdx = numCylVerts + turns;
+        const en  = spineVec[N-2];
+        const lcs = (numCylVerts - (turns+1)) * 3;
+        for (let i = 0; i < turns; i++) {
+          const s = lcs + i*3;
+          setVert(endCapIdx + i,
+            positions[s], positions[s+1], positions[s+2],
+            en.x, en.y, en.z);
+        }
+      }
+
+      // Build one combined triangle strip for the cylinder body
+      // (degenerate triangles stitch adjacent cylinders together)
+      const strip = [];
+      for (let i = 0; i < N - 1; i++) {
+        if (i > 0) strip.push(i * (turns+1));
+        for (let j = 0; j <= turns; j++) {
+          strip.push(i*(turns+1) + j);
+          strip.push((i+1)*(turns+1) + j);
+        }
+        if (i < N - 2) strip.push((i+1)*(turns+1) + turns);
+      }
+
+      // Cap strips — winding order matches Kotlin
+      const startCap = [], endCap = [];
+      if (addEndCaps) {
+        let up = 0, down = turns - 1;
+        for (let i = 0; i < turns; i++)
+          startCap.push((i & 1) === 0 ? startCapIdx + down-- : startCapIdx + up++);
+        up = turns - 1; down = 0;
+        for (let i = 0; i < turns; i++)
+          endCap.push((i & 1) === 0 ? endCapIdx + down++ : endCapIdx + up--);
+      }
+
+      // Convert all strips to indexed triangles (matches Kotlin triangles(ccw=false))
+      const ccwIdx = 1;
+      const tris   = [];
+      for (const s of (addEndCaps ? [strip, startCap, endCap] : [strip])) {
+        for (let n = 2; n < s.length; n++) {
+          const ia = s[n-2], ib = s[n-1], ic = s[n];
+          const ax = positions[ia*3], ay = positions[ia*3+1], az = positions[ia*3+2];
+          const bx = positions[ib*3], by = positions[ib*3+1], bz = positions[ib*3+2];
+          const cx = positions[ic*3], cy = positions[ic*3+1], cz = positions[ic*3+2];
+          const v0x=ax-bx, v0y=ay-by, v0z=az-bz;
+          const v1x=cx-ax, v1y=cy-ay, v1z=cz-az;
+          const ex=v0y*v1z-v0z*v1y, ey=v0z*v1x-v0x*v1z, ez=v0x*v1y-v0y*v1x;
+          if (ex*ex + ey*ey + ez*ez < 1e-20) continue; // degenerate — skip
+          tris.push(ia);
+          if (n % 2 === ccwIdx) { tris.push(ic, ib); }
+          else                  { tris.push(ib, ic); }
+        }
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('normal',   new THREE.BufferAttribute(normals,   3));
+      geo.setIndex(tris);
+      return geo;
+    }
+
+    // ─── Football Field Contours ──────────────────────────────────────────────
+    //
+    // Loads nfl_football_contours.json, builds one ExtrudedTubeMesh per segment,
+    // then merges all into a single draw call.
+    //
+    // Coordinates are raw FOP feet (no pre-scaling).  The FOP-to-room transform
+    // M = P_camera * S * inv(P_fopl) is applied to the entity by placeScreenAtHead().
+    // For non-AR preview a 1 ft = 5 mm miniature scale is set instead.
+    //
+    async function buildFieldContours() {
+      const resp = await fetch('nfl_football_contours.json');
+      const data = await resp.json();
+
+      const radius = 0.5;              // 0.5 ft — entity transform handles scale
+      const TURNS  = 8;
+
+      const allPos = [], allNorm = [], allIdx = [];
+      let base = 0;
+
+      for (const seg of data.Segments) {
+        if (seg.length < 2) continue;
+        const spine = seg.map(p => new THREE.Vector3(p.X, p.Y, p.Z));
+        const geo   = buildExtrudedTubeMesh(spine, radius, TURNS);
+        const pos   = geo.getAttribute('position');
+        const nrm   = geo.getAttribute('normal');
+        const idx   = geo.getIndex().array;
+        for (let i = 0; i < pos.count; i++) {
+          allPos.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+          allNorm.push(nrm.getX(i), nrm.getY(i), nrm.getZ(i));
+        }
+        for (let i = 0; i < idx.length; i++) allIdx.push(base + idx[i]);
+        base += pos.count;
+        geo.dispose();
+      }
+
+      const merged = new THREE.BufferGeometry();
+      merged.setAttribute('position', new THREE.Float32BufferAttribute(allPos, 3));
+      merged.setAttribute('normal',   new THREE.Float32BufferAttribute(allNorm, 3));
+      merged.setIndex(allIdx);
+
+      const material = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide, transparent: true });
+      return { geometry: merged, material };
+    }
+
+    // ─── App bootstrap ────────────────────────────────────────────────────────
+
+    const scene    = document.getElementById('scene');
+    const quad     = document.getElementById('stereo-quad');
+    const video    = document.getElementById('video');
+    const overlay  = document.getElementById('overlay');
+    const enterBtn = document.getElementById('enter-ar');
+    const exitBtn  = document.getElementById('exit-ar');
+    const statusEl = document.getElementById('status');
+
+    // Registration params set once JSON loads; used when AR session starts.
+    let regPitch    = null;   // radians
+    let regD        = 1.0;    // metres to screen
+    let regFopScale = null;   // fop_to_room_scale (feet → room metres)
+    let regInvPfopL = null;   // inverse of left FOP camera pose (THREE.Matrix4)
+    let regInvPfopR = null;   // inverse of right FOP camera pose (THREE.Matrix4)
+
+    // Field contour preview transform (non-AR and on exit): 1 ft = 5 mm miniature
+    const FIELD_PREVIEW_POS   = new THREE.Vector3(0, 1.5, -1.5);
+    const FIELD_PREVIEW_QUAT  = new THREE.Quaternion();
+    const FIELD_PREVIEW_SCALE = new THREE.Vector3(0.005, 0.005, 0.005);
+
+    // Per-eye field meshes — created once, updated by placeScreenAtHead
+    let leftFieldMesh  = null;   // Three.js layer 1 in AR (left eye only)
+    let rightFieldMesh = null;   // Three.js layer 2 in AR (right eye only)
+
+    // ── 3D AR menu state ──────────────────────────────────────────────────────
+    let arMenuGroup        = null;   // Three.Group placed in world space in AR
+    let menuContoursOn     = true;   // current toggle state
+    let contoursHitTarget  = null;   // invisible mesh for raycasting
+    let contoursToggleMesh = null;   // visible toggle button (texture swapped on toggle)
+    let xrSelectHandler    = null;   // stored so we can removeEventListener on exit
+
+    // Billboard / height-follow — UI toggle state only (math lives in WASM)
+    let menuBillboardOn        = false;
+    let billboardToggleMesh    = null;
+    let billboardHitTarget     = null;
+    let menuHeightFollowOn     = false;
+    let heightFollowToggleMesh = null;
+    let heightFollowHitTarget  = null;
+
+    // ── WASM spatial-math module ──────────────────────────────────────────────
+    //
+    // The per-eye field-contour warp transform (z-shear warp, FOP→room, billboard
+    // and height-follow updates) is computed inside a WebAssembly module to keep
+    // the implementation opaque.  The module is loaded asynchronously; if it has
+    // not finished loading by the time AR starts the contours simply won't appear.
+    //
+    let spatialMath    = null;   // SpatialMath instance (from wasm/pkg/)
+    let wasmFieldReady = false;  // true once spatialMath.place_screen() has been called
+    let regPending     = null;   // registration params buffered before WASM loads
+
+    function applyRegistrationToWasm() {
+      if (!spatialMath || !regPending) return;
+      spatialMath.set_registration(
+        regPending.scale,
+        regPending.invFopL,
+        regPending.invFopR,
+        regPending.d
+      );
+      regPending = null;
+      console.log('[wasm] registration applied');
+    }
+
+    // Dynamic import works in non-module scripts on modern Chrome.
+    import('./wasm/pkg/spatial_math.js').then(async mod => {
+      await mod.default();          // initialise / fetch the .wasm binary
+      spatialMath = new mod.SpatialMath();
+      applyRegistrationToWasm();    // catch up if JSON already loaded
+      console.log('[wasm] spatial_math ready');
+    }).catch(e => console.error('[wasm] failed to load spatial_math:', e));
+
+    // ─── 3D AR Menu ──────────────────────────────────────────────────────────
+    //
+    // A flat panel rendered as Three.js geometry in world space.
+    // All meshes: depthTest:false, renderOrder:3 — always visible over contours.
+    // Interaction: gaze ray (camera -Z) + XR 'select' event (trigger / pinch / tap).
+    //
+
+    // Render text onto a canvas and return a CanvasTexture.
+    function makeMenuTexture(text, cw, ch, opts = {}) {
+      const canvas = document.createElement('canvas');
+      canvas.width = cw; canvas.height = ch;
+      const ctx = canvas.getContext('2d');
+      if (opts.bg) { ctx.fillStyle = opts.bg; ctx.fillRect(0, 0, cw, ch); }
+      else          { ctx.clearRect(0, 0, cw, ch); }
+      ctx.fillStyle    = opts.color || '#ffffff';
+      ctx.font         = `${opts.bold ? '700 ' : ''}${opts.size || 26}px system-ui, sans-serif`;
+      ctx.textAlign    = opts.align || 'center';
+      ctx.textBaseline = 'middle';
+      const tx = opts.align === 'left' ? 14 : (opts.align === 'right' ? cw - 14 : cw / 2);
+      ctx.fillText(text, tx, ch / 2);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.NoColorSpace;
+      return tex;
+    }
+
+    // Shared material factory for menu meshes.
+    function menuMat(overrides = {}) {
+      return new THREE.MeshBasicMaterial({
+        transparent: true, depthTest: false, depthWrite: false,
+        side: THREE.DoubleSide, ...overrides
+      });
+    }
+
+    // Draw a rounded-rectangle path into ctx.
+    function _roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.arcTo(x + w, y,     x + w, y + r,     r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+      ctx.lineTo(x + r, y + h);
+      ctx.arcTo(x,     y + h, x,     y + h - r, r);
+      ctx.lineTo(x, y + r);
+      ctx.arcTo(x,     y,     x + r, y,         r);
+      ctx.closePath();
+    }
+
+    // Pill-shaped ON/OFF toggle button texture.
+    function makeToggleTex(on) {
+      const tw = 160, th = 70;
+      const canvas = document.createElement('canvas');
+      canvas.width = tw; canvas.height = th;
+      const ctx = canvas.getContext('2d');
+      _roundRect(ctx, 3, 3, tw - 6, th - 6, (th - 6) / 2);
+      ctx.fillStyle = on ? '#0070f3' : '#3a3a50';
+      ctx.fill();
+      ctx.fillStyle = on ? '#ffffff' : '#aaaaaa';
+      ctx.font = '700 28px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(on ? 'ON' : 'OFF', tw / 2, th / 2);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.colorSpace = THREE.NoColorSpace;
+      return tex;
+    }
+
+    function buildArMenu() {
+      arMenuGroup = new THREE.Group();
+      arMenuGroup.visible = false;
+
+      const W = 0.44, H = 0.30;
+      const RO = 3;
+
+      // ── Panel background — rounded corners via canvas texture ──────────────
+      const bgCW = 512, bgCH = Math.round(bgCW * H / W);
+      const bgCanvas = document.createElement('canvas');
+      bgCanvas.width = bgCW; bgCanvas.height = bgCH;
+      const bgCtx = bgCanvas.getContext('2d');
+      _roundRect(bgCtx, 3, 3, bgCW - 6, bgCH - 6, 36);
+      bgCtx.fillStyle = '#0d0d16';
+      bgCtx.fill();
+      bgCtx.strokeStyle = 'rgba(110, 120, 180, 0.55)';
+      bgCtx.lineWidth = 4;
+      bgCtx.stroke();
+      const bgTex = new THREE.CanvasTexture(bgCanvas);
+      bgTex.colorSpace = THREE.NoColorSpace;
+      const bg = new THREE.Mesh(new THREE.PlaneGeometry(W, H), menuMat({ map: bgTex }));
+      bg.renderOrder = RO;
+      arMenuGroup.add(bg);
+
+      // ── Title ──────────────────────────────────────────────────────────────
+      const title = new THREE.Mesh(new THREE.PlaneGeometry(W * 0.86, 0.044),
+        menuMat({ map: makeMenuTexture('Spatial Video Options', 480, 70,
+          { color: '#e8e8ff', size: 28, bold: true }) }));
+      title.position.set(0, H / 2 - 0.042, 0.001);
+      title.renderOrder = RO;
+      arMenuGroup.add(title);
+
+      // ── Divider ────────────────────────────────────────────────────────────
+      const div = new THREE.Mesh(new THREE.PlaneGeometry(W * 0.84, 0.0015),
+        menuMat({ color: 0x445577, opacity: 0.9 }));
+      div.position.set(0, H / 2 - 0.090, 0.001);
+      div.renderOrder = RO;
+      arMenuGroup.add(div);
+
+      // ── Row factory ────────────────────────────────────────────────────────
+      // Each row: left-aligned label + pill toggle button + invisible hit target.
+      function addRow(labelText, y, initialOn) {
+        const lbl = new THREE.Mesh(new THREE.PlaneGeometry(0.25, 0.042),
+          menuMat({ map: makeMenuTexture(labelText, 340, 62,
+            { color: '#c8c8dc', size: 22 }) }));
+        lbl.position.set(-0.055, y, 0.001);
+        lbl.renderOrder = RO;
+        arMenuGroup.add(lbl);
+
+        const btn = new THREE.Mesh(new THREE.PlaneGeometry(0.112, 0.050),
+          menuMat({ map: makeToggleTex(initialOn) }));
+        btn.position.set(0.140, y, 0.002);
+        btn.renderOrder = RO;
+        arMenuGroup.add(btn);
+
+        const hit = new THREE.Mesh(new THREE.PlaneGeometry(0.20, 0.10),
+          new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide,
+            depthTest: false }));
+        hit.position.copy(btn.position);
+        hit.renderOrder = RO;
+        arMenuGroup.add(hit);
+
+        return { btn, hit };
+      }
+
+      const r1 = addRow('Show contours',  0.028, menuContoursOn);
+      contoursToggleMesh = r1.btn; contoursHitTarget = r1.hit;
+
+      const r2 = addRow('Billboarding',  -0.026, menuBillboardOn);
+      billboardToggleMesh = r2.btn; billboardHitTarget = r2.hit;
+
+      const r3 = addRow('Height follow', -0.080, menuHeightFollowOn);
+      heightFollowToggleMesh = r3.btn; heightFollowHitTarget = r3.hit;
+
+      scene.object3D.add(arMenuGroup);
+
+      // ── Controller laser pointers ──────────────────────────────────────────
+      for (let i = 0; i < 2; i++) {
+        const ctrl = scene.renderer.xr.getController(i);
+        ctrl.visible = false;
+        const laser = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(0, 0, -3)
+          ]),
+          new THREE.LineBasicMaterial({
+            color: 0xffffff, transparent: true, opacity: 0.55, depthTest: false
+          })
+        );
+        laser.renderOrder = 4;
+        ctrl.add(laser);
+        scene.object3D.add(ctrl);
+      }
+    }
+
+    // Toggle field contour meshes and update the button texture.
+    function doToggle() {
+      menuContoursOn = !menuContoursOn;
+      if (leftFieldMesh)  leftFieldMesh.visible  = menuContoursOn;
+      if (rightFieldMesh) rightFieldMesh.visible = menuContoursOn;
+      updateContoursToggleBtn();
+      console.log('[menu] field contours:', menuContoursOn ? 'ON' : 'OFF');
+    }
+
+    function updateContoursToggleBtn() {
+      if (!contoursToggleMesh) return;
+      const old = contoursToggleMesh.material.map;
+      contoursToggleMesh.material.map = makeToggleTex(menuContoursOn);
+      contoursToggleMesh.material.needsUpdate = true;
+      if (old) old.dispose();
+    }
+
+    function doBillboardToggle() {
+      menuBillboardOn = !menuBillboardOn;
+      if (spatialMath) spatialMath.set_billboard(menuBillboardOn);
+      updateBillboardToggleBtn();
+      console.log('[menu] billboard:', menuBillboardOn ? 'ON' : 'OFF');
+    }
+
+    function updateBillboardToggleBtn() {
+      if (!billboardToggleMesh) return;
+      const old = billboardToggleMesh.material.map;
+      billboardToggleMesh.material.map = makeToggleTex(menuBillboardOn);
+      billboardToggleMesh.material.needsUpdate = true;
+      if (old) old.dispose();
+    }
+
+    function doHeightFollowToggle() {
+      menuHeightFollowOn = !menuHeightFollowOn;
+      if (spatialMath) spatialMath.set_height_follow(menuHeightFollowOn);
+      updateHeightFollowToggleBtn();
+      console.log('[menu] height follow:', menuHeightFollowOn ? 'ON' : 'OFF');
+    }
+
+    function updateHeightFollowToggleBtn() {
+      if (!heightFollowToggleMesh) return;
+      const old = heightFollowToggleMesh.material.map;
+      heightFollowToggleMesh.material.map = makeToggleTex(menuHeightFollowOn);
+      heightFollowToggleMesh.material.needsUpdate = true;
+      if (old) old.dispose();
+    }
+
+    // Place the menu panel 0.6 m in front of the user, vertical, facing them.
+    // Uses yaw-only rotation so the panel stays upright regardless of head tilt.
+    function placeMenuAtHead() {
+      if (!arMenuGroup) return;
+      const xrCam = scene.renderer.xr.getCamera();
+      if (!xrCam) return;
+      const camPos  = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
+      const camQuat = new THREE.Quaternion().setFromRotationMatrix(xrCam.matrixWorld);
+      const euler   = new THREE.Euler().setFromQuaternion(camQuat, 'YXZ');
+      const yawOnly = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, euler.y, 0));
+      const menuPos = camPos.clone().add(
+        new THREE.Vector3(0, 0.32, -0.55).applyQuaternion(yawOnly));
+      arMenuGroup.position.copy(menuPos);
+      arMenuGroup.quaternion.copy(yawOnly);
+      arMenuGroup.visible = true;
+    }
+
+    // ─── Registration-based quad placement ───────────────────────────────────
+    //
+    // Fetches both camera JSON files in parallel, computes quad size and pose
+    // using the pinhole camera model and venue-to-room scale, then applies them
+    // once the A-Frame scene is ready.
+    //
+    // Math (all units metres unless noted):
+    //   separation  = distance between left/right world_position (feet → metres)
+    //   scale       = IPD / separation_metres           (venue → room)
+    //   pitch       = asin(-view_dir.z)                 (venue Z is up)
+    //   quad height = d * H_eye / fy                    (similar triangles)
+    //   quad width  = height * (W_eye / H_eye)
+    //   position    = eye_pos + rotateX(-pitch) * [0, 0, -d]
+    //               = (0, eyeY - d·sin(pitch), -d·cos(pitch))
+    //   rotation.x  = -pitch_degrees
+    //
+    Promise.all([
+      new Promise(resolve => scene.addEventListener('loaded', resolve, { once: true })),
+      fetch('cardinals_left_rect_corr.json').then(r => r.json()),
+      fetch('cardinals_right_rect_corr.json').then(r => r.json())
+    ]).then(([_, L, R]) => {
+
+      // Camera separation (feet → metres)
+      const LP = L.world_position, RP = R.world_position;
+      const sepFt = Math.hypot(LP[0]-RP[0], LP[1]-RP[1], LP[2]-RP[2]);
+      const sepM  = sepFt / 3.28084;
+      const scale = 0.062 / sepM;   // IPD / baseline
+
+      // Pitch: venue Z is up; asin(-view_dir.z) gives camera elevation angle
+      const vz    = (L.world_view_direction[2] + R.world_view_direction[2]) / 2;
+      const pitch = Math.asin(-vz);                // radians, positive = look down
+      const pitchDeg = pitch * 180 / Math.PI;
+
+      // Quad size at desired viewer distance.
+      // Tune via URL param: ?d=2.5  (default 1.0 m)
+      // qw and qh scale linearly with d, preserving the camera FOV.
+      //
+      // img_width/img_height are the PER-EYE frame dimensions (3840×2160).
+      // camera_params cx/cy (1920,1080) are the principal point at the centre.
+      // The full stereo video frame is 3840×4320 (two per-eye frames stacked).
+      const fx    = (L.camera_params[0] + R.camera_params[0]) / 2;  // 2100.216
+      const fy    = (L.camera_params[1] + R.camera_params[1]) / 2;  // 2100.216
+      const W_eye = L.img_width;             // 3840 — per-eye width
+      const H_eye = L.img_height;            // 2160 — per-eye height (full stereo frame is 3840×4320)
+      const d     = parseFloat(new URLSearchParams(location.search).get('d') ?? '1.0');
+      const qw    = d * W_eye / fx;
+      const qh    = d * H_eye / fy;
+
+      console.log(
+        `[reg] sep=${sepFt.toFixed(3)} ft  pitch=${pitchDeg.toFixed(2)}°  ` +
+        `quad=${qw.toFixed(4)}×${qh.toFixed(4)} m`
+      );
+
+      // Store for use when the AR session starts
+      regPitch = pitch;
+      regD     = d;
+      console.log(`[reg] d=${d.toFixed(2)} m  quad=${qw.toFixed(4)}×${qh.toFixed(4)} m`);
+
+      // FOP-to-room scale: diorama_scale = IPD / baseline_metres
+      // fop_to_room_scale = diorama_scale * 0.3048  (converts feet to diorama metres)
+      const D_m = sepFt * 0.3048;
+      regFopScale = (0.062 / D_m) * 0.3048;
+
+      // Build left FOP camera pose P_fopl (camera-to-FOP-world, column-major rotation):
+      //   Z = -world_view_direction  (camera -Z faces view direction)
+      //   Y = world_up_direction
+      //   X = Y × Z  (right-hand rule)
+      const vd = L.world_view_direction;
+      const ud = L.world_up_direction;
+      const wp = L.world_position;
+      const Zvec   = new THREE.Vector3(-vd[0], -vd[1], -vd[2]).normalize();
+      const Yvec   = new THREE.Vector3( ud[0],  ud[1],  ud[2]).normalize();
+      const Xvec   = new THREE.Vector3().crossVectors(Yvec, Zvec).normalize();
+      const Yortho = new THREE.Vector3().crossVectors(Zvec, Xvec).normalize();
+      const P_fopl = new THREE.Matrix4().set(
+        Xvec.x, Yortho.x, Zvec.x, wp[0],
+        Xvec.y, Yortho.y, Zvec.y, wp[1],
+        Xvec.z, Yortho.z, Zvec.z, wp[2],
+        0,      0,        0,      1
+      );
+      regInvPfopL = P_fopl.clone().invert();
+
+      // Build right FOP camera pose (same algorithm, using R registration)
+      const vd_r = R.world_view_direction;
+      const ud_r = R.world_up_direction;
+      const wp_r = R.world_position;
+      const Zvec_r   = new THREE.Vector3(-vd_r[0], -vd_r[1], -vd_r[2]).normalize();
+      const Yvec_r   = new THREE.Vector3( ud_r[0],  ud_r[1],  ud_r[2]).normalize();
+      const Xvec_r   = new THREE.Vector3().crossVectors(Yvec_r, Zvec_r).normalize();
+      const Yortho_r = new THREE.Vector3().crossVectors(Zvec_r, Xvec_r).normalize();
+      const P_fopr = new THREE.Matrix4().set(
+        Xvec_r.x, Yortho_r.x, Zvec_r.x, wp_r[0],
+        Xvec_r.y, Yortho_r.y, Zvec_r.y, wp_r[1],
+        Xvec_r.z, Yortho_r.z, Zvec_r.z, wp_r[2],
+        0,        0,           0,        1
+      );
+      regInvPfopR = P_fopr.clone().invert();
+      console.log(`[reg] fopScale=${regFopScale.toFixed(6)}`);
+
+      // Buffer registration for WASM (module may not be loaded yet).
+      regPending = {
+        scale:   regFopScale,
+        invFopL: regInvPfopL.elements,   // Float32Array[16], column-major
+        invFopR: regInvPfopR.elements,
+        d:       regD
+      };
+      applyRegistrationToWasm();  // no-op if WASM not ready; WASM load will catch up
+
+      // Apply size now; world placement happens on AR start
+      quad.setAttribute('stereo-tb',
+        `src: #video; width: ${qw.toFixed(4)}; height: ${qh.toFixed(4)}`);
+
+      regReady = true;
+      updateButtonState();
+
+    }).catch(err => {
+      console.error('[reg] Failed to load registration JSON:', err);
+      // Fall back so the button still becomes usable
+      regPitch = 0;
+      quad.setAttribute('stereo-tb', 'src: #video; width: 3.0');
+      regReady = true;
+      updateButtonState();
+    });
+
+    // Place the screen once in world space at AR session start using the
+    // actual head pose sampled from the first XR animation frame.
+    function placeScreenAtHead() {
+      if (regPitch === null) {
+        console.warn('[reg] registration not loaded yet, using default placement');
+        regPitch = 0;
+      }
+
+      const camPos  = new THREE.Vector3();
+      const camQuat = new THREE.Quaternion();
+
+      // Read position/orientation directly from matrixWorld — avoids the scene-graph
+      // traversal that getWorldPosition() does, which can silently return (0,0,0)
+      // when the XR camera is not parented into the Three.js scene graph.
+      const xrCam = scene.renderer.xr.getCamera();
+      if (xrCam && xrCam.matrixWorld) {
+        camPos.setFromMatrixPosition(xrCam.matrixWorld);
+        camQuat.setFromRotationMatrix(xrCam.matrixWorld);
+      } else {
+        // Fallback: A-Frame's camera entity IS in the scene graph
+        const cameraEl = document.querySelector('[camera]');
+        if (cameraEl && cameraEl.object3D) {
+          cameraEl.object3D.getWorldPosition(camPos);
+          cameraEl.object3D.getWorldQuaternion(camQuat);
+        } else {
+          console.error('[reg] no camera available — retrying');
+          setTimeout(placeScreenAtHead, 100);
+          return;
+        }
+      }
+      console.log(`[reg] head pose: (${camPos.x.toFixed(3)}, ${camPos.y.toFixed(3)}, ${camPos.z.toFixed(3)})`);
+
+      // Use only the yaw component so the screen faces wherever the user is
+      // looking horizontally, ignoring head tilt / roll.
+      const euler   = new THREE.Euler().setFromQuaternion(camQuat, 'YXZ');
+      const yawQuat = new THREE.Quaternion()
+                        .setFromEuler(new THREE.Euler(0, euler.y, 0));
+
+      // Offset from eye: d metres forward + pitched down by regPitch.
+      // = Ry(yaw) * [0, -d·sin(p), -d·cos(p)]
+      const localOffset = new THREE.Vector3(
+        0,
+        -regD * Math.sin(regPitch),
+        -regD * Math.cos(regPitch)
+      ).applyQuaternion(yawQuat);
+
+      const screenPos = camPos.clone().add(localOffset);
+
+      // Screen faces the viewer: yaw to match heading, then pitch tilt.
+      const pitchQuat  = new THREE.Quaternion()
+                           .setFromAxisAngle(new THREE.Vector3(1, 0, 0), -regPitch);
+      const screenQuat = yawQuat.clone().multiply(pitchQuat);
+
+      quad.object3D.position.copy(screenPos);
+      quad.object3D.quaternion.copy(screenQuat);
+
+      console.log(`[reg] screen placed at (${screenPos.x.toFixed(3)}, ` +
+                  `${screenPos.y.toFixed(3)}, ${screenPos.z.toFixed(3)})`);
+
+      // Hand the placement to the WASM module.  From here on, updateFromWasm()
+      // computes M_l / M_r every frame and writes the results back to the meshes.
+      if (spatialMath && leftFieldMesh && rightFieldMesh) {
+        spatialMath.place_screen(
+          screenPos.x, screenPos.y, screenPos.z,
+          screenQuat.x, screenQuat.y, screenQuat.z, screenQuat.w,
+          camPos.x, camPos.y, camPos.z,
+          regPitch
+        );
+        leftFieldMesh.layers.set(1);   // left eye only in AR
+        rightFieldMesh.layers.set(2);  // right eye only in AR
+        wasmFieldReady = true;
+        console.log('[wasm] place_screen called — per-eye tracking enabled');
+      } else {
+        console.warn('[wasm] spatial_math not ready at placement time — contours inactive');
+      }
+    }
+
+    // Load field contours once the scene is ready.
+    // Two mesh copies are created from one shared geometry — one per eye.
+    // In AR they live on Three.js layers 1 (left) and 2 (right) so each is only
+    // rendered by the appropriate eye camera.  In non-AR preview both use layer 0.
+    // matrixAutoUpdate is disabled so we can write M_l / M_r directly.
+    scene.addEventListener('loaded', () => {
+      buildArMenu();
+      buildFieldContours()
+        .then(({ geometry, material }) => {
+          const previewMat = new THREE.Matrix4().compose(
+            FIELD_PREVIEW_POS, FIELD_PREVIEW_QUAT, FIELD_PREVIEW_SCALE);
+          leftFieldMesh  = new THREE.Mesh(geometry, material);
+          rightFieldMesh = new THREE.Mesh(geometry, material);
+          for (const mesh of [leftFieldMesh, rightFieldMesh]) {
+            mesh.frustumCulled = false;
+            mesh.renderOrder = 1;        // after video + depth clear
+            mesh.matrixAutoUpdate = false;
+            mesh.layers.set(0);          // preview: visible in both eyes / mono
+            mesh.matrix.copy(previewMat);
+            mesh.matrixWorldNeedsUpdate = true;
+            scene.object3D.add(mesh);    // parent = scene root (identity matrixWorld)
+          }
+          console.log('[field] contours loaded (preview pose)');
+        })
+        .catch(e => console.error('[field] failed:', e));
+    }, { once: true });
+
+    // Both flags must be true before the Enter AR button is enabled.
+    let arSupported = false;
+    let regReady    = false;
+
+    function updateButtonState() {
+      if (arSupported && regReady) {
+        enterBtn.textContent = 'Enter AR';
+        enterBtn.disabled    = false;
+        statusEl.textContent = 'AR ready — tap to begin.';
+      }
+    }
+
+    // Check immersive-ar support
+    if (!navigator.xr) {
+      statusEl.textContent = 'WebXR not supported by this browser.';
+    } else {
+      navigator.xr.isSessionSupported('immersive-ar').then(ok => {
+        if (ok) {
+          arSupported = true;
+          updateButtonState();
+        } else {
+          enterBtn.textContent = 'AR not supported';
+          statusEl.textContent = 'immersive-ar not available on this device/browser.';
+        }
+      }).catch(() => {
+        statusEl.textContent = 'Error checking XR support.';
+      });
+    }
+
+    video.addEventListener('loadedmetadata', () => {
+      statusEl.textContent = `Video ${video.videoWidth}×${video.videoHeight} — loaded.`;
+    });
+
+    // Enter AR (user gesture also unblocks video.play())
+    enterBtn.addEventListener('click', async () => {
+      enterBtn.disabled = true;
+      enterBtn.textContent = 'Starting AR…';
+      statusEl.textContent = '';
+
+      video.play().catch(e => console.warn('[video]', e));
+
+      try {
+        await (scene.enterAR ? scene.enterAR() : scene.enterVR());
+      } catch (e) {
+        console.error('[ar] session failed:', e);
+        statusEl.textContent = `Failed: ${e.message} — try again`;
+        enterBtn.textContent = 'Retry AR';
+        enterBtn.disabled = false;
+      }
+    });
+
+    exitBtn.addEventListener('click', () => scene.exitVR());
+
+    scene.addEventListener('enter-vr', () => {
+      console.log('[ar] enter-vr fired');
+      overlay.style.display = 'none';
+      exitBtn.style.display = 'block';
+      video.play().catch(e => console.warn('[video] play failed:', e));
+      setTimeout(() => {
+        placeScreenAtHead();
+        placeMenuAtHead();
+      }, 300);
+
+      // Menu interaction on XR select (controller trigger, hand pinch, or screen tap).
+      // Tries each controller's pointing ray first; falls back to head gaze.
+      xrSelectHandler = () => {
+        if (!arMenuGroup || !arMenuGroup.visible) return;
+        const rc = new THREE.Raycaster(); rc.near = 0.01; rc.far = 10;
+
+        // Controller rays — the visible laser shows where each ray points
+        for (let i = 0; i < 2; i++) {
+          const ctrl = scene.renderer.xr.getController(i);
+          if (!ctrl.visible) continue;
+          rc.set(
+            new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld),
+            new THREE.Vector3(0, 0, -1).transformDirection(ctrl.matrixWorld).normalize()
+          );
+          if (rc.intersectObject(contoursHitTarget).length > 0) { doToggle(); return; }
+          if (billboardHitTarget && rc.intersectObject(billboardHitTarget).length > 0) { doBillboardToggle(); return; }
+          if (heightFollowHitTarget && rc.intersectObject(heightFollowHitTarget).length > 0) { doHeightFollowToggle(); return; }
+        }
+
+        // Gaze fallback (head -Z direction) for hand tracking / no controllers
+        const xrCam = scene.renderer.xr.getCamera();
+        if (!xrCam) return;
+        rc.set(
+          new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld),
+          new THREE.Vector3(0, 0, -1).transformDirection(xrCam.matrixWorld).normalize()
+        );
+        if (rc.intersectObject(contoursHitTarget).length > 0) { doToggle(); }
+        else if (billboardHitTarget && rc.intersectObject(billboardHitTarget).length > 0) { doBillboardToggle(); }
+        else if (heightFollowHitTarget && rc.intersectObject(heightFollowHitTarget).length > 0) { doHeightFollowToggle(); }
+      };
+      const xrSession = scene.renderer.xr.getSession();
+      if (xrSession) xrSession.addEventListener('select', xrSelectHandler);
+    });
+
+    scene.addEventListener('exit-vr', () => {
+      console.log('[ar] exit-vr fired');
+      overlay.style.display = 'flex';
+      exitBtn.style.display = 'none';
+      // Remove XR select listener and hide 3D menu
+      const xrSession = scene.renderer.xr.getSession();
+      if (xrSession && xrSelectHandler) xrSession.removeEventListener('select', xrSelectHandler);
+      xrSelectHandler = null;
+      if (arMenuGroup) arMenuGroup.visible = false;
+      enterBtn.textContent = 'Enter AR';
+      enterBtn.disabled = false;
+      video.pause();
+      // Stop per-frame tracking; restore field meshes to preview pose
+      wasmFieldReady = false;
+      if (spatialMath) spatialMath.reset();
+      if (leftFieldMesh && rightFieldMesh) {
+        const previewMat = new THREE.Matrix4().compose(
+          FIELD_PREVIEW_POS, FIELD_PREVIEW_QUAT, FIELD_PREVIEW_SCALE);
+        for (const mesh of [leftFieldMesh, rightFieldMesh]) {
+          mesh.layers.set(0);
+          mesh.matrix.copy(previewMat);
+          mesh.matrixWorldNeedsUpdate = true;
+        }
+      }
+    });
+
+    // Surface any unhandled errors to the status div so they're visible on headset
+    window.addEventListener('error', e => {
+      statusEl.textContent = 'JS error: ' + e.message;
+      console.error('[window error]', e.message, e.filename, e.lineno);
+    });
+    window.addEventListener('unhandledrejection', e => {
+      statusEl.textContent = 'Promise error: ' + (e.reason?.message ?? e.reason);
+      console.error('[unhandledrejection]', e.reason);
+    });
+  </script>
+</body>
+</html>
