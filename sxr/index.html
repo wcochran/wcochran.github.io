@@ -17,12 +17,13 @@
     #overlay h1 { margin: 0 0 0.4em; font-size: 1.3em; font-weight: 600; }
     #overlay p  { margin: 0 0 1.4em; font-size: 0.9em; color: #aaa; text-align: center; max-width: 320px; }
 
-    #enter-ar {
+    .exp-btn {
       padding: 14px 36px; font-size: 1.05em; font-weight: 600;
       background: #0070f3; color: #fff; border: none;
       border-radius: 10px; cursor: pointer; letter-spacing: 0.02em;
+      min-width: 220px;
     }
-    #enter-ar:disabled { background: #444; cursor: default; }
+    .exp-btn:disabled { background: #444; cursor: default; }
 
     #status { margin-top: 1em; font-size: 0.8em; color: #777; }
 
@@ -47,16 +48,16 @@
     <button id="exit-ar">Exit AR</button>
   </div>
 
-  <!-- Video lives outside <a-assets> so A-Frame doesn't block scene init on it -->
+  <!-- Video lives outside <a-assets> so A-Frame doesn't block scene init on it.
+       src is set dynamically when the user picks an experience. -->
   <video
     id="video"
-    src="https://streams.quintar.ai/nfl-2025/20251207-LAR-ARI/clip1-sync1-waynereg3-fullframe.mp4"
     crossorigin="anonymous"
     loop
     muted
     playsinline
     webkit-playsinline
-    preload="metadata"
+    preload="none"
     style="display:none"
   ></video>
 
@@ -84,8 +85,11 @@
 
   <div id="overlay">
     <h1>Stereo Video AR</h1>
-    <p>Places a stereo top/bottom video on a quad in your environment via passthrough AR.</p>
-    <button id="enter-ar" disabled>Checking XR support…</button>
+    <p>Choose an AR experience:</p>
+    <div style="display:flex; flex-direction:column; align-items:center; gap:14px">
+      <button id="btn-nfl" class="exp-btn" disabled>NFL / Cardinals</button>
+      <button id="btn-mlb" class="exp-btn" disabled>MLB / Braves</button>
+    </div>
     <div id="status">Loading…</div>
   </div>
 
@@ -101,8 +105,9 @@
     AFRAME.registerComponent('stereo-tb', {
       schema: {
         src:    { type: 'string', default: '#video' },
+        mask:   { type: 'string', default: '' },  // URL to alpha mask PNG; '' = fully opaque
         width:  { type: 'number', default: 3.0 },
-        height: { type: 'number', default: 0 }   // 0 = auto-fit from video aspect ratio
+        height: { type: 'number', default: 0 }    // 0 = auto-fit from video aspect ratio
       },
 
       init: function () {
@@ -129,11 +134,22 @@
         // Alpha mask — same stereo T/B layout as the video.
         // Black pixels (r=0) → alpha=0 → XR compositor shows passthrough camera feed.
         // White pixels (r=1) → alpha=1 → video is fully opaque.
-        const maskTexture = new THREE.TextureLoader().load('cardinals_mask.png');
-        maskTexture.generateMipmaps = false;
-        maskTexture.minFilter = THREE.LinearFilter;
-        maskTexture.magFilter = THREE.LinearFilter;
-        maskTexture.colorSpace = THREE.NoColorSpace; // raw linear data — no sRGB gamma lift
+        // If no mask URL is provided, a 1×1 white texture makes the video fully opaque.
+        let maskTexture;
+        if (this.data.mask) {
+          maskTexture = new THREE.TextureLoader().load(this.data.mask);
+          maskTexture.generateMipmaps = false;
+          maskTexture.minFilter = THREE.LinearFilter;
+          maskTexture.magFilter = THREE.LinearFilter;
+          maskTexture.colorSpace = THREE.NoColorSpace; // raw linear data — no sRGB gamma lift
+        } else {
+          const mc = document.createElement('canvas');
+          mc.width = mc.height = 1;
+          mc.getContext('2d').fillStyle = 'white';
+          mc.getContext('2d').fillRect(0, 0, 1, 1);
+          maskTexture = new THREE.CanvasTexture(mc);
+          maskTexture.colorSpace = THREE.NoColorSpace;
+        }
         this.maskTexture = maskTexture;
 
         // Shader remaps the full-quad UV [0,1] to the appropriate half-frame:
@@ -452,9 +468,10 @@
     // M = P_camera * S * inv(P_fopl) is applied to the entity by placeScreenAtHead().
     // For non-AR preview a 1 ft = 5 mm miniature scale is set instead.
     //
-    async function buildFieldContours() {
-      const resp = await fetch('nfl_football_contours.json');
-      const data = await resp.json();
+    // filenames may be a single string or an array of strings.
+    async function buildFieldContours(filenames) {
+      const files = Array.isArray(filenames) ? filenames : [filenames];
+      const datasets = await Promise.all(files.map(f => fetch(f).then(r => r.json())));
 
       const radius = 0.5;              // 0.5 ft — entity transform handles scale
       const TURNS  = 8;
@@ -462,20 +479,22 @@
       const allPos = [], allNorm = [], allIdx = [];
       let base = 0;
 
-      for (const seg of data.Segments) {
-        if (seg.length < 2) continue;
-        const spine = seg.map(p => new THREE.Vector3(p.X, p.Y, p.Z));
-        const geo   = buildExtrudedTubeMesh(spine, radius, TURNS);
-        const pos   = geo.getAttribute('position');
-        const nrm   = geo.getAttribute('normal');
-        const idx   = geo.getIndex().array;
-        for (let i = 0; i < pos.count; i++) {
-          allPos.push(pos.getX(i), pos.getY(i), pos.getZ(i));
-          allNorm.push(nrm.getX(i), nrm.getY(i), nrm.getZ(i));
+      for (const data of datasets) {
+        for (const seg of data.Segments) {
+          if (seg.length < 2) continue;
+          const spine = seg.map(p => new THREE.Vector3(p.X, p.Y, p.Z));
+          const geo   = buildExtrudedTubeMesh(spine, radius, TURNS);
+          const pos   = geo.getAttribute('position');
+          const nrm   = geo.getAttribute('normal');
+          const idx   = geo.getIndex().array;
+          for (let i = 0; i < pos.count; i++) {
+            allPos.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+            allNorm.push(nrm.getX(i), nrm.getY(i), nrm.getZ(i));
+          }
+          for (let i = 0; i < idx.length; i++) allIdx.push(base + idx[i]);
+          base += pos.count;
+          geo.dispose();
         }
-        for (let i = 0; i < idx.length; i++) allIdx.push(base + idx[i]);
-        base += pos.count;
-        geo.dispose();
       }
 
       const merged = new THREE.BufferGeometry();
@@ -493,9 +512,35 @@
     const quad     = document.getElementById('stereo-quad');
     const video    = document.getElementById('video');
     const overlay  = document.getElementById('overlay');
-    const enterBtn = document.getElementById('enter-ar');
+    const btnNfl   = document.getElementById('btn-nfl');
+    const btnMlb   = document.getElementById('btn-mlb');
     const exitBtn  = document.getElementById('exit-ar');
     const statusEl = document.getElementById('status');
+
+    // ── Experience configs ─────────────────────────────────────────────────────
+    const EXPERIENCES = {
+      nfl: {
+        label:       'NFL / Cardinals',
+        videoUrl:    'https://streams.quintar.ai/nfl-2025/20251207-LAR-ARI/clip1-sync1-waynereg3-fullframe.mp4',
+        leftJson:    'cardinals_left_rect_corr.json',
+        rightJson:   'cardinals_right_rect_corr.json',
+        contoursJson:['nfl_football_contours.json'],
+        maskUrl:     'cardinals_mask.png',
+      },
+      mlb: {
+        label:       'MLB / Braves',
+        videoUrl:    'https://d2fcywl64r1lfy.cloudfront.net/mlb-2024/20240906/TOR@ATL_2B_SGLRBI1_TB.mp4',
+        leftJson:    'truist_l_corr.json',
+        rightJson:   'truist_r_corr.json',
+        contoursJson:['mlb_contours.json', 'truist_boundary.json'],
+        maskUrl:     '',   // no mask — video rendered fully opaque
+      },
+    };
+
+    let selectedExp = null;   // key into EXPERIENCES set when user picks
+
+    // Pre-loaded per-experience registration data (populated on page load).
+    const regDataMap = {};    // key → { pitch, d, fopScale, invFopL, invFopR, qw, qh }
 
     // Registration params set once JSON loads; used when AR session starts.
     let regPitch    = null;   // radians
@@ -787,127 +832,166 @@
 
     // ─── Registration-based quad placement ───────────────────────────────────
     //
-    // Fetches both camera JSON files in parallel, computes quad size and pose
-    // using the pinhole camera model and venue-to-room scale, then applies them
-    // once the A-Frame scene is ready.
+    // Computes quad size and pose from a left/right camera JSON pair using the
+    // pinhole camera model and venue-to-room scale.
     //
     // Math (all units metres unless noted):
     //   separation  = distance between left/right world_position (feet → metres)
     //   scale       = IPD / separation_metres           (venue → room)
     //   pitch       = asin(-view_dir.z)                 (venue Z is up)
     //   quad height = d * H_eye / fy                    (similar triangles)
-    //   quad width  = height * (W_eye / H_eye)
-    //   position    = eye_pos + rotateX(-pitch) * [0, 0, -d]
-    //               = (0, eyeY - d·sin(pitch), -d·cos(pitch))
-    //   rotation.x  = -pitch_degrees
+    //   quad width  = d * W_eye / fx
     //
-    Promise.all([
-      new Promise(resolve => scene.addEventListener('loaded', resolve, { once: true })),
-      fetch('cardinals_left_rect_corr.json').then(r => r.json()),
-      fetch('cardinals_right_rect_corr.json').then(r => r.json())
-    ]).then(([_, L, R]) => {
+    function computeRegData(L, R) {
+      const d = parseFloat(new URLSearchParams(location.search).get('d') ?? '1.0');
 
-      // Camera separation (feet → metres)
       const LP = L.world_position, RP = R.world_position;
       const sepFt = Math.hypot(LP[0]-RP[0], LP[1]-RP[1], LP[2]-RP[2]);
-      const sepM  = sepFt / 3.28084;
-      const scale = 0.062 / sepM;   // IPD / baseline
-
-      // Pitch: venue Z is up; asin(-view_dir.z) gives camera elevation angle
       const vz    = (L.world_view_direction[2] + R.world_view_direction[2]) / 2;
-      const pitch = Math.asin(-vz);                // radians, positive = look down
-      const pitchDeg = pitch * 180 / Math.PI;
+      const pitch = Math.asin(-vz);
 
-      // Quad size at desired viewer distance.
-      // Tune via URL param: ?d=2.5  (default 1.0 m)
-      // qw and qh scale linearly with d, preserving the camera FOV.
-      //
-      // img_width/img_height are the PER-EYE frame dimensions (3840×2160).
-      // camera_params cx/cy (1920,1080) are the principal point at the centre.
-      // The full stereo video frame is 3840×4320 (two per-eye frames stacked).
-      const fx    = (L.camera_params[0] + R.camera_params[0]) / 2;  // 2100.216
-      const fy    = (L.camera_params[1] + R.camera_params[1]) / 2;  // 2100.216
-      const W_eye = L.img_width;             // 3840 — per-eye width
-      const H_eye = L.img_height;            // 2160 — per-eye height (full stereo frame is 3840×4320)
-      const d     = parseFloat(new URLSearchParams(location.search).get('d') ?? '1.0');
+      const fx    = (L.camera_params[0] + R.camera_params[0]) / 2;
+      const fy    = (L.camera_params[1] + R.camera_params[1]) / 2;
+      const W_eye = L.img_width;
+      const H_eye = L.img_height;
       const qw    = d * W_eye / fx;
       const qh    = d * H_eye / fy;
 
-      console.log(
-        `[reg] sep=${sepFt.toFixed(3)} ft  pitch=${pitchDeg.toFixed(2)}°  ` +
-        `quad=${qw.toFixed(4)}×${qh.toFixed(4)} m`
-      );
+      const D_m    = sepFt * 0.3048;
+      const fopScale = (0.062 / D_m) * 0.3048;
 
-      // Store for use when the AR session starts
-      regPitch = pitch;
-      regD     = d;
-      console.log(`[reg] d=${d.toFixed(2)} m  quad=${qw.toFixed(4)}×${qh.toFixed(4)} m`);
+      // Build left FOP camera pose (camera-to-FOP-world, column-major rotation):
+      //   Z = -world_view_direction, Y = world_up_direction, X = Y × Z
+      function makePose(data) {
+        const vd = data.world_view_direction;
+        const ud = data.world_up_direction;
+        const wp = data.world_position;
+        const Zv = new THREE.Vector3(-vd[0], -vd[1], -vd[2]).normalize();
+        const Yv = new THREE.Vector3( ud[0],  ud[1],  ud[2]).normalize();
+        const Xv = new THREE.Vector3().crossVectors(Yv, Zv).normalize();
+        const Yo = new THREE.Vector3().crossVectors(Zv, Xv).normalize();
+        return new THREE.Matrix4().set(
+          Xv.x, Yo.x, Zv.x, wp[0],
+          Xv.y, Yo.y, Zv.y, wp[1],
+          Xv.z, Yo.z, Zv.z, wp[2],
+          0,    0,    0,    1
+        ).invert();
+      }
 
-      // FOP-to-room scale: diorama_scale = IPD / baseline_metres
-      // fop_to_room_scale = diorama_scale * 0.3048  (converts feet to diorama metres)
-      const D_m = sepFt * 0.3048;
-      regFopScale = (0.062 / D_m) * 0.3048;
+      console.log(`[reg] sep=${sepFt.toFixed(3)} ft  pitch=${(pitch*180/Math.PI).toFixed(2)}°  ` +
+                  `quad=${qw.toFixed(4)}×${qh.toFixed(4)} m  fopScale=${fopScale.toFixed(6)}`);
 
-      // Build left FOP camera pose P_fopl (camera-to-FOP-world, column-major rotation):
-      //   Z = -world_view_direction  (camera -Z faces view direction)
-      //   Y = world_up_direction
-      //   X = Y × Z  (right-hand rule)
-      const vd = L.world_view_direction;
-      const ud = L.world_up_direction;
-      const wp = L.world_position;
-      const Zvec   = new THREE.Vector3(-vd[0], -vd[1], -vd[2]).normalize();
-      const Yvec   = new THREE.Vector3( ud[0],  ud[1],  ud[2]).normalize();
-      const Xvec   = new THREE.Vector3().crossVectors(Yvec, Zvec).normalize();
-      const Yortho = new THREE.Vector3().crossVectors(Zvec, Xvec).normalize();
-      const P_fopl = new THREE.Matrix4().set(
-        Xvec.x, Yortho.x, Zvec.x, wp[0],
-        Xvec.y, Yortho.y, Zvec.y, wp[1],
-        Xvec.z, Yortho.z, Zvec.z, wp[2],
-        0,      0,        0,      1
-      );
-      regInvPfopL = P_fopl.clone().invert();
+      return { pitch, d, fopScale, invFopL: makePose(L), invFopR: makePose(R), qw, qh };
+    }
 
-      // Build right FOP camera pose (same algorithm, using R registration)
-      const vd_r = R.world_view_direction;
-      const ud_r = R.world_up_direction;
-      const wp_r = R.world_position;
-      const Zvec_r   = new THREE.Vector3(-vd_r[0], -vd_r[1], -vd_r[2]).normalize();
-      const Yvec_r   = new THREE.Vector3( ud_r[0],  ud_r[1],  ud_r[2]).normalize();
-      const Xvec_r   = new THREE.Vector3().crossVectors(Yvec_r, Zvec_r).normalize();
-      const Yortho_r = new THREE.Vector3().crossVectors(Zvec_r, Xvec_r).normalize();
-      const P_fopr = new THREE.Matrix4().set(
-        Xvec_r.x, Yortho_r.x, Zvec_r.x, wp_r[0],
-        Xvec_r.y, Yortho_r.y, Zvec_r.y, wp_r[1],
-        Xvec_r.z, Yortho_r.z, Zvec_r.z, wp_r[2],
-        0,        0,           0,        1
-      );
-      regInvPfopR = P_fopr.clone().invert();
-      console.log(`[reg] fopScale=${regFopScale.toFixed(6)}`);
+    // Pre-load registration JSON for both experiences in parallel.
+    // Buttons enable once XR is confirmed AND both loads finish.
+    const regLoads = Object.entries(EXPERIENCES).map(([key, exp]) =>
+      Promise.all([
+        fetch(exp.leftJson).then(r => r.json()),
+        fetch(exp.rightJson).then(r => r.json())
+      ]).then(([L, R]) => {
+        regDataMap[key] = computeRegData(L, R);
+        console.log(`[reg] loaded: ${key}`);
+      }).catch(err => {
+        console.warn(`[reg] failed to load ${key} registration:`, err);
+      })
+    );
 
-      // Buffer registration for WASM (module may not be loaded yet).
-      regPending = {
-        scale:   regFopScale,
-        invFopL: regInvPfopL.elements,   // Float32Array[16], column-major
-        invFopR: regInvPfopR.elements,
-        d:       regD
-      };
-      applyRegistrationToWasm();  // no-op if WASM not ready; WASM load will catch up
+    // Apply a pre-computed registration to the active global vars + WASM.
+    function applyExperienceReg(key, exp) {
+      const reg = regDataMap[key];
+      if (reg) {
+        regPitch    = reg.pitch;
+        regD        = reg.d;
+        regFopScale = reg.fopScale;
+        regInvPfopL = reg.invFopL;
+        regInvPfopR = reg.invFopR;
+        regPending  = {
+          scale:   reg.fopScale,
+          invFopL: reg.invFopL.elements,
+          invFopR: reg.invFopR.elements,
+          d:       reg.d
+        };
+        applyRegistrationToWasm();
+        const maskPart = exp.maskUrl ? `mask: ${exp.maskUrl}; ` : '';
+        quad.removeAttribute('stereo-tb');
+        quad.setAttribute('stereo-tb',
+          `src: #video; ${maskPart}width: ${reg.qw.toFixed(4)}; height: ${reg.qh.toFixed(4)}`);
+      } else {
+        regPitch = 0;
+        const maskPart = exp.maskUrl ? `mask: ${exp.maskUrl}; ` : '';
+        quad.removeAttribute('stereo-tb');
+        quad.setAttribute('stereo-tb', `src: #video; ${maskPart}width: 3.0`);
+      }
+    }
 
-      // Apply size now; world placement happens on AR start
-      quad.setAttribute('stereo-tb',
-        `src: #video; width: ${qw.toFixed(4)}; height: ${qh.toFixed(4)}`);
+    // Rebuild field contour meshes for the chosen experience.
+    function loadFieldContoursForExp(contoursJson) {
+      // Dispose previous meshes if any
+      for (const mesh of [leftFieldMesh, rightFieldMesh]) {
+        if (mesh) { scene.object3D.remove(mesh); mesh.geometry.dispose(); }
+      }
+      leftFieldMesh = rightFieldMesh = null;
+      wasmFieldReady = false;
+      if (spatialMath) spatialMath.reset();
 
-      regReady = true;
-      updateButtonState();
+      buildFieldContours(contoursJson)
+        .then(({ geometry, material }) => {
+          const previewMat = new THREE.Matrix4().compose(
+            FIELD_PREVIEW_POS, FIELD_PREVIEW_QUAT, FIELD_PREVIEW_SCALE);
+          leftFieldMesh  = new THREE.Mesh(geometry, material);
+          rightFieldMesh = new THREE.Mesh(geometry, material);
+          for (const mesh of [leftFieldMesh, rightFieldMesh]) {
+            mesh.frustumCulled = false;
+            mesh.renderOrder = 1;
+            mesh.matrixAutoUpdate = false;
+            mesh.layers.set(0);
+            mesh.matrix.copy(previewMat);
+            mesh.matrixWorldNeedsUpdate = true;
+            scene.object3D.add(mesh);
+          }
+          if (menuContoursOn === false) {
+            leftFieldMesh.visible = rightFieldMesh.visible = false;
+          }
+          console.log(`[field] contours loaded: ${contoursJson}`);
+        })
+        .catch(e => console.error('[field] failed:', e));
+    }
 
-    }).catch(err => {
-      console.error('[reg] Failed to load registration JSON:', err);
-      // Fall back so the button still becomes usable
-      regPitch = 0;
-      quad.setAttribute('stereo-tb', 'src: #video; width: 3.0');
-      regReady = true;
-      updateButtonState();
-    });
+    // ── Experience selection ───────────────────────────────────────────────────
+
+    async function selectAndEnterAR(key) {
+      const exp = EXPERIENCES[key];
+      selectedExp = key;
+
+      btnNfl.disabled = true;
+      btnMlb.disabled = true;
+      statusEl.textContent = '';
+
+      // Switch video source
+      video.src = exp.videoUrl;
+      video.load();
+
+      // Apply registration + stereo-tb component
+      applyExperienceReg(key, exp);
+
+      // Load contours for this sport
+      loadFieldContoursForExp(exp.contoursJson);
+
+      video.play().catch(e => console.warn('[video]', e));
+
+      try {
+        await (scene.enterAR ? scene.enterAR() : scene.enterVR());
+      } catch (e) {
+        console.error('[ar] session failed:', e);
+        statusEl.textContent = `Failed: ${e.message} — try again`;
+        updateButtonState();
+      }
+    }
+
+    btnNfl.addEventListener('click', () => selectAndEnterAR('nfl'));
+    btnMlb.addEventListener('click', () => selectAndEnterAR('mlb'));
 
     // Place the screen once in world space at AR session start using the
     // actual head pose sampled from the first XR animation frame.
@@ -986,42 +1070,20 @@
       }
     }
 
-    // Load field contours once the scene is ready.
-    // Two mesh copies are created from one shared geometry — one per eye.
-    // In AR they live on Three.js layers 1 (left) and 2 (right) so each is only
-    // rendered by the appropriate eye camera.  In non-AR preview both use layer 0.
-    // matrixAutoUpdate is disabled so we can write M_l / M_r directly.
+    // Build AR menu once the scene is ready (no field contours yet — loaded on experience select).
     scene.addEventListener('loaded', () => {
       buildArMenu();
-      buildFieldContours()
-        .then(({ geometry, material }) => {
-          const previewMat = new THREE.Matrix4().compose(
-            FIELD_PREVIEW_POS, FIELD_PREVIEW_QUAT, FIELD_PREVIEW_SCALE);
-          leftFieldMesh  = new THREE.Mesh(geometry, material);
-          rightFieldMesh = new THREE.Mesh(geometry, material);
-          for (const mesh of [leftFieldMesh, rightFieldMesh]) {
-            mesh.frustumCulled = false;
-            mesh.renderOrder = 1;        // after video + depth clear
-            mesh.matrixAutoUpdate = false;
-            mesh.layers.set(0);          // preview: visible in both eyes / mono
-            mesh.matrix.copy(previewMat);
-            mesh.matrixWorldNeedsUpdate = true;
-            scene.object3D.add(mesh);    // parent = scene root (identity matrixWorld)
-          }
-          console.log('[field] contours loaded (preview pose)');
-        })
-        .catch(e => console.error('[field] failed:', e));
     }, { once: true });
 
-    // Both flags must be true before the Enter AR button is enabled.
+    // Buttons enable once AR is confirmed supported AND all reg JSONs are loaded.
     let arSupported = false;
-    let regReady    = false;
+    let regsLoaded  = false;
 
     function updateButtonState() {
-      if (arSupported && regReady) {
-        enterBtn.textContent = 'Enter AR';
-        enterBtn.disabled    = false;
-        statusEl.textContent = 'AR ready — tap to begin.';
+      if (arSupported && regsLoaded) {
+        btnNfl.disabled = false;
+        btnMlb.disabled = false;
+        statusEl.textContent = 'Choose an experience above.';
       }
     }
 
@@ -1034,7 +1096,7 @@
           arSupported = true;
           updateButtonState();
         } else {
-          enterBtn.textContent = 'AR not supported';
+          btnNfl.textContent = btnMlb.textContent = 'AR not supported';
           statusEl.textContent = 'immersive-ar not available on this device/browser.';
         }
       }).catch(() => {
@@ -1042,26 +1104,10 @@
       });
     }
 
-    video.addEventListener('loadedmetadata', () => {
-      statusEl.textContent = `Video ${video.videoWidth}×${video.videoHeight} — loaded.`;
-    });
-
-    // Enter AR (user gesture also unblocks video.play())
-    enterBtn.addEventListener('click', async () => {
-      enterBtn.disabled = true;
-      enterBtn.textContent = 'Starting AR…';
-      statusEl.textContent = '';
-
-      video.play().catch(e => console.warn('[video]', e));
-
-      try {
-        await (scene.enterAR ? scene.enterAR() : scene.enterVR());
-      } catch (e) {
-        console.error('[ar] session failed:', e);
-        statusEl.textContent = `Failed: ${e.message} — try again`;
-        enterBtn.textContent = 'Retry AR';
-        enterBtn.disabled = false;
-      }
+    // Enable buttons once registration data for both experiences is ready.
+    Promise.all(regLoads).then(() => {
+      regsLoaded = true;
+      updateButtonState();
     });
 
     exitBtn.addEventListener('click', () => scene.exitVR());
@@ -1119,9 +1165,8 @@
       if (xrSession && xrSelectHandler) xrSession.removeEventListener('select', xrSelectHandler);
       xrSelectHandler = null;
       if (arMenuGroup) arMenuGroup.visible = false;
-      enterBtn.textContent = 'Enter AR';
-      enterBtn.disabled = false;
       video.pause();
+      updateButtonState();
       // Stop per-frame tracking; restore field meshes to preview pose
       wasmFieldReady = false;
       if (spatialMath) spatialMath.reset();
