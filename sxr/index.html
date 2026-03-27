@@ -89,6 +89,7 @@
     <div style="display:flex; flex-direction:column; align-items:center; gap:14px">
       <button id="btn-nfl" class="exp-btn" disabled>NFL / Cardinals</button>
       <button id="btn-mlb" class="exp-btn" disabled>MLB / Braves</button>
+      <button id="btn-nba" class="exp-btn" disabled>NBA / Hawks</button>
     </div>
     <div id="status">Loading…</div>
   </div>
@@ -514,6 +515,7 @@
     const overlay  = document.getElementById('overlay');
     const btnNfl   = document.getElementById('btn-nfl');
     const btnMlb   = document.getElementById('btn-mlb');
+    const btnNba   = document.getElementById('btn-nba');
     const exitBtn  = document.getElementById('exit-ar');
     const statusEl = document.getElementById('status');
 
@@ -534,6 +536,14 @@
         rightJson:   'truist_r_corr.json',
         contoursJson:['mlb_contours.json', 'truist_boundary.json'],
         maskUrl:     '',   // no mask — video rendered fully opaque
+      },
+      nba: {
+        label:       'NBA / Hawks',
+        videoUrl:    'https://streams.quintar.ai/nba-2025/20250310/76ers-hawks-clip1-tb.mp4',
+        leftJson:    'hawks_left_corr.json',
+        rightJson:   'hawks_right_corr.json',
+        contoursJson:['NBA_court.json'],
+        maskUrl:     'hawks_mask_tb.png',
       },
     };
 
@@ -967,6 +977,7 @@
 
       btnNfl.disabled = true;
       btnMlb.disabled = true;
+      btnNba.disabled = true;
       statusEl.textContent = '';
 
       // Switch video source
@@ -992,6 +1003,7 @@
 
     btnNfl.addEventListener('click', () => selectAndEnterAR('nfl'));
     btnMlb.addEventListener('click', () => selectAndEnterAR('mlb'));
+    btnNba.addEventListener('click', () => selectAndEnterAR('nba'));
 
     // Place the screen once in world space at AR session start using the
     // actual head pose sampled from the first XR animation frame.
@@ -1083,6 +1095,7 @@
       if (arSupported && regsLoaded) {
         btnNfl.disabled = false;
         btnMlb.disabled = false;
+        btnNba.disabled = false;
         statusEl.textContent = 'Choose an experience above.';
       }
     }
@@ -1096,7 +1109,7 @@
           arSupported = true;
           updateButtonState();
         } else {
-          btnNfl.textContent = btnMlb.textContent = 'AR not supported';
+          btnNfl.textContent = btnMlb.textContent = btnNba.textContent = 'AR not supported';
           statusEl.textContent = 'immersive-ar not available on this device/browser.';
         }
       }).catch(() => {
