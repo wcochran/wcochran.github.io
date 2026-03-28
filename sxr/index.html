@@ -1077,7 +1077,7 @@
         );
         const isStereo = xrCam.cameras && xrCam.cameras.length >= 2;
         leftFieldMesh.layers.set(isStereo ? 1 : 0);   // left eye only in stereo; all in mono
-        rightFieldMesh.layers.set(isStereo ? 2 : 0);  // right eye only in stereo; all in mono
+        rightFieldMesh.layers.set(isStereo ? 2 : 31); // right eye only in stereo; unused in mono
         wasmFieldReady = true;
         console.log('[wasm] place_screen called — per-eye tracking enabled');
       } else {
