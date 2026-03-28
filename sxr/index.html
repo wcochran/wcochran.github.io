@@ -835,8 +835,22 @@
       const camQuat = new THREE.Quaternion().setFromRotationMatrix(xrCam.matrixWorld);
       const euler   = new THREE.Euler().setFromQuaternion(camQuat, 'YXZ');
       const yawOnly = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, euler.y, 0));
+
+      // Place menu so its bottom clears the screen top by ~8° of visual angle.
+      // Without this, low-pitch experiences (e.g. NBA) have the menu overlap the video.
+      const MENU_DIST    = 0.55;
+      const MENU_HALF_H  = 0.15;   // half of panel H (0.30 m)
+      const MARGIN_RAD   = 8 * Math.PI / 180;
+      let menuY = 0.32;            // fallback if reg not yet loaded
+      const reg = selectedExp && regDataMap[selectedExp];
+      if (reg && regPitch !== null) {
+        const screenTopY    = -reg.d * Math.sin(regPitch) + reg.qh / 2;
+        const screenTopAngle = Math.atan2(screenTopY, reg.d * Math.cos(regPitch));
+        menuY = Math.tan(screenTopAngle + MARGIN_RAD) * MENU_DIST + MENU_HALF_H;
+      }
+
       const menuPos = camPos.clone().add(
-        new THREE.Vector3(0, 0.32, -0.55).applyQuaternion(yawOnly));
+        new THREE.Vector3(0, menuY, -MENU_DIST).applyQuaternion(yawOnly));
       arMenuGroup.position.copy(menuPos);
       arMenuGroup.quaternion.copy(yawOnly);
       arMenuGroup.visible = true;
