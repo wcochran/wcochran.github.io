@@ -265,22 +265,24 @@
     function updateFromWasm() {
       if (!spatialMath || !wasmFieldReady || !leftFieldMesh || !rightFieldMesh) return;
       const xrCam = scene.renderer.xr.getCamera();
-      if (!xrCam || !xrCam.cameras || xrCam.cameras.length < 2) return;
+      if (!xrCam) return;
+      const isStereo = xrCam.cameras && xrCam.cameras.length >= 2;
 
       // Each matrixWorld.elements is already a Float32Array (column-major, 16 floats).
-      const result = spatialMath.update(
-        xrCam.cameras[0].matrixWorld.elements,
-        xrCam.cameras[1].matrixWorld.elements,
-        xrCam.matrixWorld.elements
-      );
+      // In mono mode pass the single camera matrix for both eyes — outputs are identical.
+      const leftMat  = isStereo ? xrCam.cameras[0].matrixWorld.elements : xrCam.matrixWorld.elements;
+      const rightMat = isStereo ? xrCam.cameras[1].matrixWorld.elements : xrCam.matrixWorld.elements;
+      const result = spatialMath.update(leftMat, rightMat, xrCam.matrixWorld.elements);
 
       // result[0..16]  — left-eye  M4 (column-major)
       leftFieldMesh.matrix.fromArray(result, 0);
       leftFieldMesh.matrixWorldNeedsUpdate = true;
 
-      // result[16..32] — right-eye M4 (column-major)
-      rightFieldMesh.matrix.fromArray(result, 16);
-      rightFieldMesh.matrixWorldNeedsUpdate = true;
+      // result[16..32] — right-eye M4 (column-major); skip in mono (same as left)
+      if (isStereo) {
+        rightFieldMesh.matrix.fromArray(result, 16);
+        rightFieldMesh.matrixWorldNeedsUpdate = true;
+      }
 
       // result[32..35] — screen position  (updated by height-follow / billboard)
       // result[35..39] — screen quaternion (updated by billboard)
@@ -1073,8 +1075,9 @@
           camPos.x, camPos.y, camPos.z,
           regPitch
         );
-        leftFieldMesh.layers.set(1);   // left eye only in AR
-        rightFieldMesh.layers.set(2);  // right eye only in AR
+        const isStereo = xrCam.cameras && xrCam.cameras.length >= 2;
+        leftFieldMesh.layers.set(isStereo ? 1 : 0);   // left eye only in stereo; all in mono
+        rightFieldMesh.layers.set(isStereo ? 2 : 0);  // right eye only in stereo; all in mono
         wasmFieldReady = true;
         console.log('[wasm] place_screen called — per-eye tracking enabled');
       } else {
