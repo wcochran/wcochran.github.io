@@ -6,7 +6,8 @@
   <title>Stereo Video AR</title>
   <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
   <!-- hls.js — Chrome has no native HLS <video> support; needed for .m3u8 streams -->
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js"></script>
+  <!-- 1.6+ required: our streams are HEVC in MPEG-TS, which 1.5's demuxer can't parse -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"></script>
   <style>
     html, body { margin: 0; height: 100%; background: #111; }
 
@@ -1009,6 +1010,8 @@
       if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
       if (/\.m3u8(\?|$)/.test(exp.videoUrl) && window.Hls && Hls.isSupported()) {
         hlsPlayer = new Hls();
+        hlsPlayer.on(Hls.Events.ERROR, (_, data) =>
+          console.error('[hls]', data.type, data.details, data.fatal ? '(fatal)' : ''));
         hlsPlayer.loadSource(exp.videoUrl);
         hlsPlayer.attachMedia(video);
       } else {
