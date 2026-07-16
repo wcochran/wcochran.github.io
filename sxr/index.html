@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>Stereo Video AR</title>
   <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <!-- hls.js — Chrome has no native HLS <video> support; needed for .m3u8 streams -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js"></script>
   <style>
     html, body { margin: 0; height: 100%; background: #111; }
 
@@ -87,9 +89,10 @@
     <h1>Stereo Video AR</h1>
     <p>Choose an AR experience:</p>
     <div style="display:flex; flex-direction:column; align-items:center; gap:14px">
-      <button id="btn-nfl" class="exp-btn" disabled>NFL / Cardinals</button>
-      <button id="btn-mlb" class="exp-btn" disabled>MLB / Braves</button>
-      <button id="btn-nba" class="exp-btn" disabled>NBA / Hawks</button>
+      <button class="exp-btn" data-exp="nfl" disabled>NFL / Cardinals</button>
+      <button class="exp-btn" data-exp="mlb" disabled>MLB / Braves</button>
+      <button class="exp-btn" data-exp="nba" disabled>NBA / Hawks</button>
+      <button class="exp-btn" data-exp="tennis" disabled>Tennis / Intennse</button>
     </div>
     <div id="status">Loading…</div>
   </div>
@@ -515,9 +518,7 @@
     const quad     = document.getElementById('stereo-quad');
     const video    = document.getElementById('video');
     const overlay  = document.getElementById('overlay');
-    const btnNfl   = document.getElementById('btn-nfl');
-    const btnMlb   = document.getElementById('btn-mlb');
-    const btnNba   = document.getElementById('btn-nba');
+    const expButtons = Array.from(document.querySelectorAll('.exp-btn'));
     const exitBtn  = document.getElementById('exit-ar');
     const statusEl = document.getElementById('status');
 
@@ -547,9 +548,18 @@
         contoursJson:['NBA_court.json'],
         maskUrl:     'hawks_mask_tb.png',
       },
+      tennis: {
+        label:       'Tennis / Intennse',
+        videoUrl:    'https://meta-spatial-vids-dev.spatial.quintar.ai/IN0003/zcam/20260710/40mb/5/index.m3u8',
+        leftJson:    'tennis2-L-rectified_corr.json',
+        rightJson:   'tennis2-R-rectified_corr.json',
+        contoursJson:['tennis_court_contours_net.json'],
+        maskUrl:     'intennse_mask_tb.png',
+      },
     };
 
     let selectedExp = null;   // key into EXPERIENCES set when user picks
+    let hlsPlayer   = null;   // hls.js instance when the active experience streams HLS
 
     // Pre-loaded per-experience registration data (populated on page load).
     const regDataMap = {};    // key → { pitch, d, fopScale, invFopL, invFopR, qw, qh }
@@ -991,14 +1001,20 @@
       const exp = EXPERIENCES[key];
       selectedExp = key;
 
-      btnNfl.disabled = true;
-      btnMlb.disabled = true;
-      btnNba.disabled = true;
+      expButtons.forEach(b => { b.disabled = true; });
       statusEl.textContent = '';
 
-      // Switch video source
-      video.src = exp.videoUrl;
-      video.load();
+      // Switch video source — HLS (.m3u8) streams go through hls.js since
+      // Chrome has no native HLS <video> support.
+      if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+      if (/\.m3u8(\?|$)/.test(exp.videoUrl) && window.Hls && Hls.isSupported()) {
+        hlsPlayer = new Hls();
+        hlsPlayer.loadSource(exp.videoUrl);
+        hlsPlayer.attachMedia(video);
+      } else {
+        video.src = exp.videoUrl;
+        video.load();
+      }
 
       // Apply registration + stereo-tb component
       applyExperienceReg(key, exp);
@@ -1017,9 +1033,8 @@
       }
     }
 
-    btnNfl.addEventListener('click', () => selectAndEnterAR('nfl'));
-    btnMlb.addEventListener('click', () => selectAndEnterAR('mlb'));
-    btnNba.addEventListener('click', () => selectAndEnterAR('nba'));
+    expButtons.forEach(b =>
+      b.addEventListener('click', () => selectAndEnterAR(b.dataset.exp)));
 
     // Place the screen once in world space at AR session start using the
     // actual head pose sampled from the first XR animation frame.
@@ -1110,9 +1125,7 @@
 
     function updateButtonState() {
       if (arSupported && regsLoaded) {
-        btnNfl.disabled = false;
-        btnMlb.disabled = false;
-        btnNba.disabled = false;
+        expButtons.forEach(b => { b.disabled = false; });
         statusEl.textContent = 'Choose an experience above.';
       }
     }
@@ -1126,7 +1139,7 @@
           arSupported = true;
           updateButtonState();
         } else {
-          btnNfl.textContent = btnMlb.textContent = btnNba.textContent = 'AR not supported';
+          expButtons.forEach(b => { b.textContent = 'AR not supported'; });
           statusEl.textContent = 'immersive-ar not available on this device/browser.';
         }
       }).catch(() => {
