@@ -566,6 +566,13 @@
     const TENNIS_JOINT_RADIUS = 0.10; // FOP feet
     const TENNIS_PLAYER_COLORS = { S0AG: 0x00ffff, A0E2: 0xff9500 };  // Sinner cyan, Alcaraz orange
 
+    // Ball trail — matches RegAR's TennisRallyBallPlayer/TennisRallyPlayer values.
+    const COMET_TRAIL_FEET   = 16;    // length of the lit comet tail, FOP feet
+    const RIBBON_WIDTH       = 0.25;  // FOP feet (see stereo-tb note: no /2 — matches ribbon_material.usda's raw side*ribbonWidth offset)
+    const BALL_RADIUS        = 0.4;   // FOP feet
+    const COMET_PATH_SAMPLES = 200;   // samples across a whole rally's continuous ball path
+    const SHOT_PATH_SAMPLES  = 50;    // samples across a single shot arc (matches RegAR's pathFeet() default)
+
     // Shared unit cylinder for all bone segments (radius 1, length 1, base at
     // y=0) — one geometry reused via per-instance position/scale/quaternion,
     // matching RegAR's "one shared unit-cylinder mesh, transform-animated per
@@ -582,7 +589,17 @@
     let tennisSkeletonsR   = {};
     let tennisBounceRingsL = [];    // [{ mesh, t, shown }]
     let tennisBounceRingsR = [];
-    let tennisMatch        = null;  // { skelFrames, bounces, duration }
+    // Comet mode: one ribbon mesh per rally (only the currently-active rally's
+    // ribbon is visible/animated at a time), plus one ball sphere.
+    let tennisCometRibbonsL = [];   // [{ mesh, rally }]
+    let tennisCometRibbonsR = [];
+    let tennisCometBallL    = null;
+    let tennisCometBallR    = null;
+    // Full/persistent mode: one ribbon per Hit/Bounce arc, drawn in once and left.
+    let tennisShotRibbonsL = [];    // [{ mesh, arc, started }]
+    let tennisShotRibbonsR = [];
+    let menuFullTrailOn    = false; // false = comet trail (default), true = persistent per-shot ribbons
+    let tennisMatch        = null;  // { skelFrames, bounces, duration, ballRallies, shotArcs }
     let tennisClock        = 0;     // seconds, loops over tennisMatch.duration
     let tennisOverlayActive = false;
 
@@ -603,7 +620,14 @@
       const t0abs = Date.parse(json.frames[0].ts);
 
       const skelFrames = [];
+      // objectId of whoever's hitting each shot, keyed "segment:shot:arc" —
+      // used below to color per-shot ball trails by the striking player.
+      const hitterByKey = new Map();
       for (const fr of json.frames) {
+        const b = fr.ball;
+        if (b && fr.hitter && !hitterByKey.has(`${b.segment}:${b.shot}:${b.arc}`)) {
+          hitterByKey.set(`${b.segment}:${b.shot}:${b.arc}`, fr.hitter);
+        }
         if (!fr.players || fr.players.length === 0) continue;
         const t = (Date.parse(fr.ts) - t0abs) / 1000;
         const byId = {};
@@ -617,23 +641,146 @@
       }
 
       const bounces = [];
+      // Every ball-flight arc (Toss/Hit/Skid/Bounce/Clip), global-timed, kept for
+      // both the continuous per-rally ball path (all kinds) and the persistent
+      // per-shot ribbons (Hit/Bounce only) — see buildBallRallies/buildShotArcs.
+      const arcs = [];
       for (const m of json.motions) {
-        if (m.arc_type !== 'Skid') continue;
         const zeroAbs  = Date.parse(m.zero_time_utc);
         const startAbs = Date.parse(m.ts_start);
         const endAbs   = Date.parse(m.ts_end);
-        const tLocalMid = ((startAbs - zeroAbs) + (endAbs - zeroAbs)) / 2 / 1000;
-        const x = evalPoly(m.curve_params.x, tLocalMid) * FEET_PER_METER;
-        const y = evalPoly(m.curve_params.y, tLocalMid) * FEET_PER_METER;
-        const tGlobal = ((startAbs + endAbs) / 2 - t0abs) / 1000;
-        bounces.push({ t: tGlobal, pos: new THREE.Vector3(x, y, 0) });
+        // Polynomials are evaluated at (segment-local time relative to that arc's
+        // own zero_time_utc); deltaSeg converts our global clock into that local
+        // time: tLocal = tGlobal + deltaSeg (see CurveGenerator.swift/evalPoly).
+        const deltaSeg = (t0abs - zeroAbs) / 1000;
+        arcs.push({
+          segment: m.segment, shot: m.shot, arcNum: m.arc, kind: m.arc_type,
+          tGlobalStart: (startAbs - t0abs) / 1000,
+          tGlobalEnd:   (endAbs   - t0abs) / 1000,
+          deltaSeg, cx: m.curve_params.x, cy: m.curve_params.y, cz: m.curve_params.z
+        });
+
+        if (m.arc_type === 'Skid') {
+          const tLocalMid = ((startAbs - zeroAbs) + (endAbs - zeroAbs)) / 2 / 1000;
+          const x = evalPoly(m.curve_params.x, tLocalMid) * FEET_PER_METER;
+          const y = evalPoly(m.curve_params.y, tLocalMid) * FEET_PER_METER;
+          const tGlobal = ((startAbs + endAbs) / 2 - t0abs) / 1000;
+          bounces.push({ t: tGlobal, pos: new THREE.Vector3(x, y, 0) });
+        }
       }
+      arcs.sort((a, b) => a.tGlobalStart - b.tGlobalStart);
       bounces.sort((a, b) => a.t - b.t);
 
       const duration = skelFrames.length ? skelFrames[skelFrames.length - 1].t : 0;
+      const ballRallies = buildBallRallies(arcs);
+      const shotArcs = buildShotArcs(arcs, hitterByKey);
+      const hitColorTimeline = buildHitColorTimeline(arcs, hitterByKey);
       console.log(`[tennis-data] parsed ${skelFrames.length} skeleton frames, ` +
-                  `${bounces.length} bounces, duration ${duration.toFixed(1)}s`);
-      return { skelFrames, bounces, duration };
+                  `${bounces.length} bounces, ${ballRallies.length} ball rallies, ` +
+                  `${shotArcs.length} shot arcs, duration ${duration.toFixed(1)}s`);
+      return { skelFrames, bounces, duration, ballRallies, shotArcs, hitColorTimeline };
+    }
+
+    // Sorted (by tGlobalStart, since `arcs` already is) list of {t, color} for
+    // every Hit whose striker we could identify — the comet trail looks up
+    // "most recent Hit at/before now" each frame to recolor by striker, mirroring
+    // TennisRallyBallPlayer's hitColors (per-shot ribbons bake their color once
+    // at creation instead, via buildShotArcs, since each is its own short-lived arc).
+    function buildHitColorTimeline(arcs, hitterByKey) {
+      const timeline = [];
+      for (const a of arcs) {
+        if (a.kind !== 'Hit') continue;
+        const hitterId = hitterByKey.get(`${a.segment}:${a.shot}:${a.arcNum}`);
+        if (hitterId && TENNIS_PLAYER_COLORS[hitterId] !== undefined) {
+          timeline.push({ t: a.tGlobalStart, color: TENNIS_PLAYER_COLORS[hitterId] });
+        }
+      }
+      return timeline;
+    }
+
+    // Most recent timeline color at/before t, or fallback if none yet.
+    function colorAt(timeline, t, fallback) {
+      let c = fallback;
+      for (const e of timeline) { if (e.t <= t) c = e.color; else break; }
+      return c;
+    }
+
+    // Evaluates a power-basis polynomial curve (x,y,z) at global time `tau`,
+    // stepping through `arcs` (sorted by tGlobalStart) to find whichever arc is
+    // active at that moment — mirrors TennisMotions.continuousRallyPathFeet's
+    // arc-stepping, but keyed off our single global clock instead of per-segment
+    // local time. `ai` is a mutable single-element array so callers can resume
+    // stepping forward across repeated calls with increasing tau (avoids
+    // rescanning from the start each sample).
+    function evalArcsAt(arcs, tau, aiRef) {
+      while (aiRef[0] < arcs.length - 1 && tau > arcs[aiRef[0]].tGlobalEnd) aiRef[0]++;
+      const a = arcs[aiRef[0]];
+      const tLocal = tau + a.deltaSeg;
+      return new THREE.Vector3(
+        evalPoly(a.cx, tLocal) * FEET_PER_METER,
+        evalPoly(a.cy, tLocal) * FEET_PER_METER,
+        evalPoly(a.cz, tLocal) * FEET_PER_METER
+      );
+    }
+
+    // Samples arcs[] (already sorted, single contiguous run e.g. one rally's or
+    // one shot's arcs) into `samples` evenly-spaced points across [tMin, tMax] —
+    // mirrors TennisMotions.continuousRallyPathFeet.
+    function sampleArcPath(arcs, tMin, tMax, samples) {
+      const n = Math.max(2, samples);
+      const pts = [];
+      const aiRef = [0];
+      for (let i = 0; i < n; i++) {
+        const tau = tMin + (tMax - tMin) * i / (n - 1);
+        pts.push(evalArcsAt(arcs, tau, aiRef));
+      }
+      return pts;
+    }
+
+    // Groups arcs by rally (segment) and builds one continuous sampled ball path
+    // per rally, plus its cumulative arc length (for the comet-trail windowing).
+    function buildBallRallies(arcs) {
+      const bySegment = new Map();
+      for (const a of arcs) {
+        if (!bySegment.has(a.segment)) bySegment.set(a.segment, []);
+        bySegment.get(a.segment).push(a);
+      }
+      const rallies = [];
+      for (const segArcs of bySegment.values()) {
+        segArcs.sort((a, b) => a.tGlobalStart - b.tGlobalStart);
+        const tGlobalStart = segArcs[0].tGlobalStart;
+        const tGlobalEnd   = Math.max(...segArcs.map(a => a.tGlobalEnd));
+        const path = sampleArcPath(segArcs, tGlobalStart, tGlobalEnd, COMET_PATH_SAMPLES);
+        const cumulativeLength = [0];
+        for (let i = 1; i < path.length; i++) {
+          cumulativeLength.push(cumulativeLength[i - 1] + path[i].distanceTo(path[i - 1]));
+        }
+        rallies.push({ tGlobalStart, tGlobalEnd, path, cumulativeLength,
+                        totalLength: cumulativeLength[cumulativeLength.length - 1] });
+      }
+      rallies.sort((a, b) => a.tGlobalStart - b.tGlobalStart);
+      return rallies;
+    }
+
+    // One persistent ribbon per Hit/Bounce arc, colored by whichever player
+    // struck the most recent Hit at/before it — mirrors TennisRallyPlayer's
+    // per-arc color(for:) (a Bounce shares its preceding Hit's color).
+    function buildShotArcs(arcs, hitterByKey) {
+      const shotArcs = arcs.filter(a => a.kind === 'Hit' || a.kind === 'Bounce');
+      const colors = Object.values(TENNIS_PLAYER_COLORS);
+      let lastColor = colors[0] ?? 0xffffff;
+      const out = [];
+      for (const a of shotArcs) {
+        if (a.kind === 'Hit') {
+          const hitterId = hitterByKey.get(`${a.segment}:${a.shot}:${a.arcNum}`);
+          if (hitterId && TENNIS_PLAYER_COLORS[hitterId] !== undefined) {
+            lastColor = TENNIS_PLAYER_COLORS[hitterId];
+          }
+        }
+        const path = sampleArcPath([a], a.tGlobalStart, a.tGlobalEnd, SHOT_PATH_SAMPLES);
+        out.push({ tGlobalStart: a.tGlobalStart, tGlobalEnd: a.tGlobalEnd, path, color: lastColor });
+      }
+      return out;
     }
 
     function buildSkeletonEntity(color) {
@@ -735,6 +882,140 @@
       return mesh;
     }
 
+    // ─── Ball Shot Trail Ribbon (camera-facing, GLSL) ──────────────────────────
+    //
+    // Ported from RegAR's RibbonMesh.swift + ribbon_material.usda (a RealityKit
+    // ShaderGraphMaterial), translated node-for-node into GLSL:
+    //
+    //  - Geometry: each path sample becomes TWO coincident vertices (uv.x = -1/+1,
+    //    "side"), carrying a per-vertex tangent (direction along the path) and
+    //    uv.y = fraction along the path (0..1). No width is baked in — width and
+    //    camera-facing orientation are computed per-frame in the vertex shader,
+    //    exactly like RegAR's GeometryModifier (which reads the tangent out of
+    //    the mesh's *normal* channel — a RealityKit-specific workaround this port
+    //    doesn't need, since GLSL lets us just declare a real `tangent` attribute).
+    //  - Fragment shader: reveals the ribbon up to `fractionAlong`, fades in the
+    //    trailing edge from `fractionBehind` over `tailFeather` (0 = hard cut,
+    //    used by the persistent per-shot mode; >0 = soft feather, used by the
+    //    comet mode), plus tiny cosmetic feathers at the path's absolute v=0/v=1
+    //    ends (featherStart/featherEnd) and a dash pattern (dashLength/
+    //    dashFraction, left at their no-op defaults — neither trail mode dashes).
+    //
+    function buildRibbonGeometry(path) {
+      const N = path.length;
+      const positions = new Float32Array(2 * N * 3);
+      const tangents  = new Float32Array(2 * N * 3);
+      const uvs       = new Float32Array(2 * N * 2);
+      const jointTangents = new Array(N);
+      for (let i = 1; i < N - 1; i++) {
+        jointTangents[i] = path[i + 1].clone().sub(path[i - 1]).normalize();
+      }
+      jointTangents[0]     = path[1].clone().sub(path[0]).normalize();
+      jointTangents[N - 1] = path[N - 1].clone().sub(path[N - 2]).normalize();
+
+      for (let i = 0; i < N; i++) {
+        const p = path[i], t = jointTangents[i], y = i / (N - 1);
+        for (const side of [-1, 1]) {
+          const vi = 2 * i + (side === -1 ? 0 : 1);
+          positions[vi * 3]     = p.x; positions[vi * 3 + 1] = p.y; positions[vi * 3 + 2] = p.z;
+          tangents[vi * 3]      = t.x; tangents[vi * 3 + 1]  = t.y; tangents[vi * 3 + 2]  = t.z;
+          uvs[vi * 2]           = side; uvs[vi * 2 + 1]      = y;
+        }
+      }
+      const indices = [];
+      for (let n = 2; n < 2 * N; n++) {
+        const i = n - 2, j = n - 1, k = n;
+        if (n % 2 === 0) indices.push(i, j, k); else indices.push(i, k, j);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('tangent',  new THREE.BufferAttribute(tangents, 3));
+      geo.setAttribute('uv',       new THREE.BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+      return geo;
+    }
+
+    const RIBBON_VERTEX_SHADER = /* glsl */`
+      attribute vec3 tangent;
+      uniform float uRibbonWidth;
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        vec3 worldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+        vec3 worldTangent = normalize(mat3(modelMatrix) * tangent);
+        vec3 viewDir = normalize(cameraPosition - worldPos);
+        vec3 offsetDir = normalize(cross(viewDir, worldTangent));
+        worldPos += offsetDir * uv.x * uRibbonWidth;
+        gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+      }
+    `;
+
+    const RIBBON_FRAGMENT_SHADER = /* glsl */`
+      uniform float uFractionAlong;
+      uniform float uFractionBehind;
+      uniform float uTailFeather;
+      uniform float uFeatherStart;
+      uniform float uFeatherEnd;
+      uniform float uDashLength;
+      uniform float uDashFraction;
+      uniform float uGlobalOpacity;
+      uniform vec3  uColor;
+      varying vec2 vUv;
+      void main() {
+        float v = vUv.y;
+        float reveal = step(v, uFractionAlong);
+        float dashCycle = fract(v / max(uDashLength, 0.001));
+        float dash = step(dashCycle, uDashFraction);
+        float tail = clamp((v - uFractionBehind) / max(uTailFeather, 0.0001), 0.0, 1.0);
+        float headFeather = clamp(v / max(uFeatherStart, 0.001), 0.0, 1.0);
+        float endFeather = clamp((1.0 - v) / max(uFeatherEnd, 0.001), 0.0, 1.0);
+        float opacity = uGlobalOpacity * reveal * dash * tail * headFeather * endFeather;
+        if (opacity <= 0.0) discard;
+        gl_FragColor = vec4(uColor, opacity);
+      }
+    `;
+
+    function buildRibbonMaterial(color) {
+      return new THREE.ShaderMaterial({
+        uniforms: {
+          uRibbonWidth:    { value: RIBBON_WIDTH },
+          uFractionAlong:  { value: 0 },
+          uFractionBehind: { value: 0 },
+          uTailFeather:    { value: 0.0001 },
+          uFeatherStart:   { value: 0.001 },
+          uFeatherEnd:     { value: 0.001 },
+          uDashLength:     { value: 1 },
+          uDashFraction:   { value: 1 },
+          uGlobalOpacity:  { value: 1 },
+          uColor:          { value: new THREE.Color(color) }
+        },
+        vertexShader: RIBBON_VERTEX_SHADER,
+        fragmentShader: RIBBON_FRAGMENT_SHADER,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: true
+      });
+    }
+
+    function buildRibbonMesh(path, color) {
+      const mesh = new THREE.Mesh(buildRibbonGeometry(path), buildRibbonMaterial(color));
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 1;   // same viewscreen depth-clear survival as skeleton/rings
+      return mesh;
+    }
+
+    // Small tennis-ball-yellow sphere riding the head of the comet trail.
+    function buildTrailBall() {
+      const geo = new THREE.SphereGeometry(BALL_RADIUS, 12, 10);
+      const mat = new THREE.MeshBasicMaterial({ color: 0xd9f000, transparent: true });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 1;
+      return mesh;
+    }
+
     // Removes any skeleton/ring content previously parented onto leftFieldMesh/
     // rightFieldMesh and disposes their (non-shared) geometries/materials.
     // Always safe to call even if nothing is loaded.
@@ -752,6 +1033,9 @@
       }
       tennisSkeletonsL = tennisSkeletonsR = {};
       tennisBounceRingsL = tennisBounceRingsR = [];
+      tennisCometRibbonsL = tennisCometRibbonsR = [];
+      tennisCometBallL = tennisCometBallR = null;
+      tennisShotRibbonsL = tennisShotRibbonsR = [];
       tennisMatch = null;
       tennisClock = 0;
       tennisOverlayActive = false;
@@ -790,8 +1074,33 @@
           mesh.layers.mask = parentMesh.layers.mask;
           return { mesh, t: b.t, shown: false };
         });
-        if (eye === 'L') { tennisSkeletonsL = skelMap; tennisBounceRingsL = rings; }
-        else             { tennisSkeletonsR = skelMap; tennisBounceRingsR = rings; }
+
+        const fallbackColor = Object.values(TENNIS_PLAYER_COLORS)[0] ?? 0xffffff;
+        const cometRibbons = tennisMatch.ballRallies.map(rally => {
+          const mesh = buildRibbonMesh(rally.path, fallbackColor);
+          parentMesh.add(mesh);
+          mesh.layers.mask = parentMesh.layers.mask;
+          return { mesh, rally };
+        });
+        const ball = buildTrailBall();
+        parentMesh.add(ball);
+        ball.layers.mask = parentMesh.layers.mask;
+
+        const shotRibbons = tennisMatch.shotArcs.map(arc => {
+          const mesh = buildRibbonMesh(arc.path, arc.color);
+          mesh.material.uniforms.uFeatherStart.value = 0.15;   // soft head fade-in, matches TennisRallyPlayer
+          parentMesh.add(mesh);
+          mesh.layers.mask = parentMesh.layers.mask;
+          return { mesh, arc, started: false };
+        });
+
+        if (eye === 'L') {
+          tennisSkeletonsL = skelMap; tennisBounceRingsL = rings;
+          tennisCometRibbonsL = cometRibbons; tennisCometBallL = ball; tennisShotRibbonsL = shotRibbons;
+        } else {
+          tennisSkeletonsR = skelMap; tennisBounceRingsR = rings;
+          tennisCometRibbonsR = cometRibbons; tennisCometBallR = ball; tennisShotRibbonsR = shotRibbons;
+        }
       }
 
       tennisOverlayActive = true;
@@ -814,6 +1123,9 @@
         tennisClock -= tennisMatch.duration;
         for (const rings of [tennisBounceRingsL, tennisBounceRingsR]) {
           for (const r of rings) { r.mesh.visible = false; r.shown = false; }
+        }
+        for (const ribbons of [tennisShotRibbonsL, tennisShotRibbonsR]) {
+          for (const r of ribbons) { r.mesh.visible = false; r.started = false; }
         }
       }
 
@@ -838,6 +1150,97 @@
         for (const b of rings) {
           if (!b.shown && tennisClock >= b.t) { b.shown = true; b.mesh.visible = true; }
         }
+      }
+
+      if (menuFullTrailOn) { hideCometTrail(); updateShotTrails(); }
+      else                 { hideShotTrails(); updateCometTrail(); }
+    }
+
+    // Largest index whose cumulative length is <= target (binary search) —
+    // mirrors TennisRallyBallPlayer.behindIndexForLength.
+    function behindIndexForLength(cumulativeLength, target) {
+      let lo = 0, hi = cumulativeLength.length - 1, result = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (cumulativeLength[mid] <= target) { result = mid; lo = mid + 1; }
+        else hi = mid - 1;
+      }
+      return result;
+    }
+
+    // Comet mode: exactly one rally's ribbon is visible at a time (whichever
+    // contains tennisClock — during an inter-point gap, none does, and the
+    // trail/ball simply vanish, same as the skeletons already do in that gap).
+    // A fixed-length (COMET_TRAIL_FEET) window trails behind the head, feathered
+    // to transparent at its tail — mirrors TennisRallyBallPlayer.update(dt:).
+    function updateCometTrail() {
+      let active = null;
+      for (const rally of tennisMatch.ballRallies) {
+        if (tennisClock >= rally.tGlobalStart && tennisClock <= rally.tGlobalEnd) { active = rally; break; }
+      }
+      const fallbackColor = Object.values(TENNIS_PLAYER_COLORS)[0] ?? 0xffffff;
+      const color = colorAt(tennisMatch.hitColorTimeline, tennisClock, fallbackColor);
+
+      for (let i = 0; i < tennisMatch.ballRallies.length; i++) {
+        const rally = tennisMatch.ballRallies[i];
+        const isActive = rally === active;
+        for (const ribbons of [tennisCometRibbonsL, tennisCometRibbonsR]) {
+          const { mesh } = ribbons[i];
+          mesh.visible = isActive;
+          if (!isActive) continue;
+          const span = rally.tGlobalEnd - rally.tGlobalStart;
+          const head = span > 1e-6 ? THREE.MathUtils.clamp((tennisClock - rally.tGlobalStart) / span, 0, 1) : 0;
+          const headIndex = Math.round(head * (rally.path.length - 1));
+          const targetLength = Math.max(0, rally.cumulativeLength[headIndex] - COMET_TRAIL_FEET);
+          const behind = behindIndexForLength(rally.cumulativeLength, targetLength) / (rally.path.length - 1);
+          const u = mesh.material.uniforms;
+          u.uFractionAlong.value  = head;
+          u.uFractionBehind.value = behind;
+          u.uTailFeather.value    = 0.5 * Math.max(0, head - behind);
+          u.uColor.value.setHex(color);
+        }
+      }
+
+      for (const ball of [tennisCometBallL, tennisCometBallR]) {
+        ball.visible = !!active;
+        if (!active) continue;
+        const span = active.tGlobalEnd - active.tGlobalStart;
+        const head = span > 1e-6 ? THREE.MathUtils.clamp((tennisClock - active.tGlobalStart) / span, 0, 1) : 0;
+        const headIndexF = head * (active.path.length - 1);
+        const i0 = Math.floor(headIndexF), i1 = Math.min(i0 + 1, active.path.length - 1);
+        ball.position.copy(active.path[i0]).lerp(active.path[i1], headIndexF - i0);
+      }
+    }
+
+    function hideCometTrail() {
+      for (const ribbons of [tennisCometRibbonsL, tennisCometRibbonsR]) {
+        for (const { mesh } of ribbons) mesh.visible = false;
+      }
+      if (tennisCometBallL) tennisCometBallL.visible = false;
+      if (tennisCometBallR) tennisCometBallR.visible = false;
+    }
+
+    // Full/persistent mode: each Hit/Bounce arc's ribbon draws in once its start
+    // time arrives, then stays fully drawn (fractionAlong clamps at 1) for the
+    // rest of this loop of the match — mirrors TennisRallyPlayer.update(dt:).
+    function updateShotTrails() {
+      for (let i = 0; i < tennisMatch.shotArcs.length; i++) {
+        const arc = tennisMatch.shotArcs[i];
+        const started = tennisClock >= arc.tGlobalStart;
+        for (const ribbons of [tennisShotRibbonsL, tennisShotRibbonsR]) {
+          const entry = ribbons[i];
+          if (!started) { entry.mesh.visible = false; continue; }
+          entry.mesh.visible = true;
+          const span = arc.tGlobalEnd - arc.tGlobalStart;
+          const f = span > 1e-6 ? THREE.MathUtils.clamp((tennisClock - arc.tGlobalStart) / span, 0, 1) : 1;
+          entry.mesh.material.uniforms.uFractionAlong.value = f;
+        }
+      }
+    }
+
+    function hideShotTrails() {
+      for (const ribbons of [tennisShotRibbonsL, tennisShotRibbonsR]) {
+        for (const { mesh } of ribbons) mesh.visible = false;
       }
     }
 
@@ -935,6 +1338,9 @@
     let menuHeightFollowOn     = false;
     let heightFollowToggleMesh = null;
     let heightFollowHitTarget  = null;
+    // menuFullTrailOn declared with the other tennis-data state, above
+    let fullTrailToggleMesh    = null;
+    let fullTrailHitTarget     = null;
 
     // ── WASM spatial-math module ──────────────────────────────────────────────
     //
@@ -1038,7 +1444,7 @@
       arMenuGroup = new THREE.Group();
       arMenuGroup.visible = false;
 
-      const W = 0.44, H = 0.30;
+      const W = 0.44, H = 0.36;
       const RO = 3;
 
       // ── Panel background — rounded corners via canvas texture ──────────────
@@ -1107,6 +1513,9 @@
 
       const r3 = addRow('Height follow', -0.080, menuHeightFollowOn);
       heightFollowToggleMesh = r3.btn; heightFollowHitTarget = r3.hit;
+
+      const r4 = addRow('Full ball trail', -0.134, menuFullTrailOn);
+      fullTrailToggleMesh = r4.btn; fullTrailHitTarget = r4.hit;
 
       scene.object3D.add(arMenuGroup);
 
@@ -1177,6 +1586,22 @@
       const old = heightFollowToggleMesh.material.map;
       heightFollowToggleMesh.material.map = makeToggleTex(menuHeightFollowOn);
       heightFollowToggleMesh.material.needsUpdate = true;
+      if (old) old.dispose();
+    }
+
+    // OFF (default) = comet trail (short trailing tail); ON = persistent
+    // per-shot ribbons (each shot draws in and stays, building up rally history).
+    function doFullTrailToggle() {
+      menuFullTrailOn = !menuFullTrailOn;
+      updateFullTrailToggleBtn();
+      console.log('[menu] full ball trail:', menuFullTrailOn ? 'ON' : 'OFF');
+    }
+
+    function updateFullTrailToggleBtn() {
+      if (!fullTrailToggleMesh) return;
+      const old = fullTrailToggleMesh.material.map;
+      fullTrailToggleMesh.material.map = makeToggleTex(menuFullTrailOn);
+      fullTrailToggleMesh.material.needsUpdate = true;
       if (old) old.dispose();
     }
 
@@ -1542,6 +1967,7 @@
           if (rc.intersectObject(contoursHitTarget).length > 0) { doToggle(); return; }
           if (billboardHitTarget && rc.intersectObject(billboardHitTarget).length > 0) { doBillboardToggle(); return; }
           if (heightFollowHitTarget && rc.intersectObject(heightFollowHitTarget).length > 0) { doHeightFollowToggle(); return; }
+          if (fullTrailHitTarget && rc.intersectObject(fullTrailHitTarget).length > 0) { doFullTrailToggle(); return; }
         }
 
         // Gaze fallback (head -Z direction) for hand tracking / no controllers
@@ -1554,6 +1980,7 @@
         if (rc.intersectObject(contoursHitTarget).length > 0) { doToggle(); }
         else if (billboardHitTarget && rc.intersectObject(billboardHitTarget).length > 0) { doBillboardToggle(); }
         else if (heightFollowHitTarget && rc.intersectObject(heightFollowHitTarget).length > 0) { doHeightFollowToggle(); }
+        else if (fullTrailHitTarget && rc.intersectObject(fullTrailHitTarget).length > 0) { doFullTrailToggle(); }
       };
       const xrSession = scene.renderer.xr.getSession();
       if (xrSession) xrSession.addEventListener('select', xrSelectHandler);
