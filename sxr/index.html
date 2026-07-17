@@ -1130,10 +1130,14 @@
     }
 
     // Toggle field contour meshes and update the button texture.
+    // Toggles the contour material's own visibility rather than the mesh
+    // object's — leftFieldMesh/rightFieldMesh are also the parent of any
+    // tennis skeleton/ring overlay, and Object3D.visible=false would hide
+    // that too (Three.js skips a whole subtree when a parent isn't visible).
     function doToggle() {
       menuContoursOn = !menuContoursOn;
-      if (leftFieldMesh)  leftFieldMesh.visible  = menuContoursOn;
-      if (rightFieldMesh) rightFieldMesh.visible = menuContoursOn;
+      if (leftFieldMesh)  leftFieldMesh.material.visible  = menuContoursOn;
+      if (rightFieldMesh) rightFieldMesh.material.visible = menuContoursOn;
       updateContoursToggleBtn();
       console.log('[menu] field contours:', menuContoursOn ? 'ON' : 'OFF');
     }
@@ -1338,7 +1342,7 @@
             scene.object3D.add(mesh);
           }
           if (menuContoursOn === false) {
-            leftFieldMesh.visible = rightFieldMesh.visible = false;
+            leftFieldMesh.material.visible = rightFieldMesh.material.visible = false;
           }
           console.log(`[field] contours loaded: ${exp.contoursJson}`);
           if (exp.matchDataUrl) return loadTennisMatchOverlay(exp.matchDataUrl);
