@@ -637,7 +637,12 @@
     }
 
     function buildSkeletonEntity(color) {
-      const material  = new THREE.MeshBasicMaterial({ color });
+      // transparent:true (queues it after the opaque pass) + renderOrder:1
+      // (matches leftFieldMesh/rightFieldMesh) — needed so it draws *after*
+      // the stereo-tb viewscreen's clearDepth() call, same as the contour
+      // lines, or the (closer, simple flat-plane) viewscreen can win the
+      // depth test against this more precisely-warped content and paint over it.
+      const material  = new THREE.MeshBasicMaterial({ color, transparent: true });
       const sphereGeo = new THREE.SphereGeometry(TENNIS_JOINT_RADIUS, 10, 8);
       const group  = new THREE.Group();
       const joints = [];
@@ -646,6 +651,7 @@
         const m = new THREE.Mesh(sphereGeo, material);
         m.visible = false;
         m.frustumCulled = false;
+        m.renderOrder = 1;
         group.add(m);
         joints.push(m);
       }
@@ -653,6 +659,7 @@
         const m = new THREE.Mesh(TENNIS_UNIT_CYLINDER, material);
         m.visible = false;
         m.frustumCulled = false;
+        m.renderOrder = 1;
         group.add(m);
         bones.push(m);
       }
@@ -714,14 +721,17 @@
     }
 
     // Flat annulus (diameter 2 ft, ring width 0.3 ft — same dimensions as
-    // RegAR's makeBounceRing), unlit and opaque (grazing-angle translucent
-    // rings anti-alias into broken arcs — same rationale as the reference app).
+    // RegAR's makeBounceRing), fully opaque color (alpha stays 1 — grazing-angle
+    // translucent rings anti-alias into broken arcs, same rationale as the
+    // reference app) but transparent:true + renderOrder:1 so it still queues
+    // and draws after the viewscreen's clearDepth(), like the skeleton meshes.
     function buildBounceRing() {
       const geo = new THREE.RingGeometry(0.7, 1.0, 32);
-      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, transparent: true });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.visible = false;
       mesh.frustumCulled = false;
+      mesh.renderOrder = 1;
       return mesh;
     }
 
