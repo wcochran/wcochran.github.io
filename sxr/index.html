@@ -619,6 +619,12 @@
     let tennisMatch        = null;  // { skelFrames, bounces, duration, ballRallies, shotArcs }
     let tennisClock        = 0;     // seconds, loops over tennisMatch.duration
     let tennisOverlayActive = false;
+    // Index into tennisMatch.ballRallies of whichever rally is currently active,
+    // or -1 during an inter-point gap; -2 is "not yet determined" so the very
+    // first tick doesn't spuriously count as a transition. Tracked so bounce
+    // rings/persistent shot trails clear at each rally boundary, not just once
+    // per full match loop.
+    let tennisLastRallyIndex = -2;
 
     function evalPoly(coeffs, t) {
       let r = 0;
@@ -1155,6 +1161,7 @@
       tennisShotRibbonsL = tennisShotRibbonsR = [];
       tennisMatch = null;
       tennisClock = 0;
+      tennisLastRallyIndex = -2;
       tennisOverlayActive = false;
     }
 
@@ -1228,6 +1235,18 @@
     // match), interpolates skeleton pose between the bracketing frames, and
     // reveals each bounce ring once the clock passes its timestamp. Updates
     // both eye copies — their transforms come for free from their parent mesh.
+    // Hides every bounce ring and persistent shot ribbon and marks them
+    // unrevealed again — used both at the full-match loop boundary and at each
+    // individual rally transition (see tennisLastRallyIndex below).
+    function clearRingsAndShotTrails() {
+      for (const rings of [tennisBounceRingsL, tennisBounceRingsR]) {
+        for (const r of rings) { r.mesh.visible = false; r.shown = false; }
+      }
+      for (const ribbons of [tennisShotRibbonsL, tennisShotRibbonsR]) {
+        for (const r of ribbons) { r.mesh.visible = false; r.started = false; }
+      }
+    }
+
     function updateTennisMatchOverlay(dtMs) {
       if (!tennisMatch || !tennisMatch.skelFrames.length) return;
       // dt can be undefined on a component's very first tick, and can arrive as
@@ -1238,12 +1257,7 @@
       tennisClock += dt;
       while (tennisClock > tennisMatch.duration) {
         tennisClock -= tennisMatch.duration;
-        for (const rings of [tennisBounceRingsL, tennisBounceRingsR]) {
-          for (const r of rings) { r.mesh.visible = false; r.shown = false; }
-        }
-        for (const ribbons of [tennisShotRibbonsL, tennisShotRibbonsR]) {
-          for (const r of ribbons) { r.mesh.visible = false; r.started = false; }
-        }
+        clearRingsAndShotTrails();
       }
 
       const frames = tennisMatch.skelFrames;
@@ -1263,6 +1277,17 @@
         if (tennisSkeletonsR[id]) updateSkeletonEntity(tennisSkeletonsR[id], joints);
       }
 
+      // Clear rings/persistent trails at every rally boundary (not just once
+      // per full match loop) — includes both rally→gap and gap→rally
+      // transitions, so nothing from a finished rally lingers into the gap
+      // before the next one starts.
+      const activeRallyIndex = tennisMatch.ballRallies.findIndex(
+        r => tennisClock >= r.tGlobalStart && tennisClock <= r.tGlobalEnd);
+      if (activeRallyIndex !== tennisLastRallyIndex) {
+        clearRingsAndShotTrails();
+        tennisLastRallyIndex = activeRallyIndex;
+      }
+
       for (const rings of [tennisBounceRingsL, tennisBounceRingsR]) {
         for (const b of rings) {
           if (!b.shown && tennisClock >= b.t) { b.shown = true; b.mesh.visible = true; }
@@ -1271,7 +1296,7 @@
 
       updateRibbonCameraUniform();
       if (menuFullTrailOn) { hideCometTrail(); updateShotTrails(); }
-      else                 { hideShotTrails(); updateCometTrail(); }
+      else                 { hideShotTrails(); updateCometTrail(activeRallyIndex); }
     }
 
     // Every ribbon parented directly onto leftFieldMesh/rightFieldMesh shares
@@ -1316,11 +1341,8 @@
     // trail/ball simply vanish, same as the skeletons already do in that gap).
     // A fixed-length (COMET_TRAIL_FEET) window trails behind the head, feathered
     // to transparent at its tail — mirrors TennisRallyBallPlayer.update(dt:).
-    function updateCometTrail() {
-      let active = null;
-      for (const rally of tennisMatch.ballRallies) {
-        if (tennisClock >= rally.tGlobalStart && tennisClock <= rally.tGlobalEnd) { active = rally; break; }
-      }
+    function updateCometTrail(activeRallyIndex) {
+      const active = tennisMatch.ballRallies[activeRallyIndex] ?? null;
       const fallbackColor = Object.values(TENNIS_PLAYER_COLORS)[0] ?? 0xffffff;
       const color = colorAt(tennisMatch.hitColorTimeline, tennisClock, fallbackColor);
 
