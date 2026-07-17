@@ -95,6 +95,7 @@
       <button class="exp-btn" data-exp="nba" disabled>NBA / Hawks</button>
       <button class="exp-btn" data-exp="tennis" disabled>Tennis / Intennse</button>
       <button class="exp-btn" data-exp="matcat" disabled>Tennis / Mat Cat</button>
+      <button class="exp-btn" data-exp="tennisSkeletons" disabled>Tennis / Skeletons</button>
     </div>
     <div id="status">Loading…</div>
   </div>
@@ -302,7 +303,18 @@
     }
 
     AFRAME.registerComponent('field-tracker', {
-      tick: function () { updateFromWasm(); }
+      tick: function (time, timeDelta) {
+        updateFromWasm();
+        if (tennisDataActive) {
+          try {
+            updateTennisDataViz(timeDelta);
+          } catch (e) {
+            console.error('[tennis-data] update failed, disabling:', e);
+            statusEl.textContent = 'Tennis data error: ' + e.message;
+            tennisDataActive = false;
+          }
+        }
+      }
     });
 
     // ─── Extruded Tube Mesh — port of ExtrudedTubeMesh.kt ────────────────────
@@ -520,6 +532,322 @@
       return { geometry: merged, material };
     }
 
+    // ─── Tennis Match Data Visualization (skeletons + bounce rings) ───────────
+    //
+    // A non-video "data-only" experience: player skeletons and ball-bounce
+    // rings animated from tracking data (sample_tennis_data_v4.json), shown as
+    // a miniature (1 ft = 5 mm) tabletop diorama rather than tied to any
+    // physical camera registration. Ported from the iOS RegAR app's
+    // SkeletonEntity/TennisMotions/BounceRingDropper — see that codebase for
+    // the reference implementation this mirrors.
+    //
+    // Units/coordinates: source JSON positions are meters, Z-up, court-center
+    // origin ("FOP" — same convention as the *_contours.json files already used
+    // for football/basketball/tennis court lines). FEET_PER_METER converts to
+    // FOP feet to match those files. TENNIS_DATA_QUAT then tilts FOP Z-up onto
+    // Three.js Y-up so skeletons stand upright on a virtual tabletop, unlike the
+    // FIELD_PREVIEW_QUAT used for the flat (Z≈0) sport contours, which is left
+    // as an identity "picture" orientation because it's never used to hold
+    // anything with real height.
+    //
+    // Ball shot trails (the ribbon shader) and racquets (the Catmull-Rom hoop)
+    // are not yet ported — this covers skeletons + bounce rings only.
+
+    const FEET_PER_METER = 3.280839895;
+
+    // Body bone connectivity (indices into the 13 tracked body joints) and per-
+    // player color, matching RegAR's SkeletonEntity.bones / ContentView colors.
+    const TENNIS_BONES = [
+      [0, 1], [1, 3], [3, 5],     // neck → lShoulder → lElbow → lWrist
+      [0, 2], [2, 4], [4, 6],     // neck → rShoulder → rElbow → rWrist
+      [0, 7], [7, 9], [9, 11],    // neck → lHip → lKnee → lAnkle
+      [0, 8], [8, 10], [10, 12],  // neck → rHip → rKnee → rAnkle
+      [7, 8]                      // lHip ↔ rHip (pelvis cross-bar)
+    ];
+    const TENNIS_JOINT_COUNT  = 13;   // body joints drawn as spheres (racquet/indices 13-19 not yet ported)
+    const TENNIS_BONE_RADIUS  = 0.07; // FOP feet
+    const TENNIS_JOINT_RADIUS = 0.10; // FOP feet
+    const TENNIS_PLAYER_COLORS = { S0AG: 0x00ffff, A0E2: 0xff9500 };  // Sinner cyan, Alcaraz orange
+
+    // Miniature tabletop placement (analogous to FIELD_PREVIEW_* but tilted
+    // upright so height (FOP Z) maps to Three.js Y instead of Z).
+    const TENNIS_DATA_SCALE = new THREE.Vector3(0.005, 0.005, 0.005);
+    const TENNIS_DATA_QUAT  = new THREE.Quaternion()
+      .setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+    const TENNIS_DATA_PREVIEW_POS = new THREE.Vector3(0, 1.2, -1.2);
+
+    // Shared unit cylinder for all bone segments (radius 1, length 1, base at
+    // y=0) — one geometry reused via per-instance position/scale/quaternion,
+    // matching RegAR's "one shared unit-cylinder mesh, transform-animated per
+    // frame" approach (no per-frame mesh regeneration).
+    const TENNIS_UNIT_CYLINDER = (() => {
+      const geo = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
+      geo.translate(0, 0.5, 0);
+      return geo;
+    })();
+
+    let tennisDataGroup   = null;   // THREE.Group holding court + skeletons + rings
+    let tennisCourtMesh   = null;
+    let tennisSkeletons   = {};     // objectId -> { group, joints[13], bones[13] }
+    let tennisBounceRings = [];     // [{ mesh, t, shown }]
+    let tennisMatch       = null;   // { skelFrames, bounces, duration }
+    let tennisClock       = 0;      // seconds, loops over tennisMatch.duration
+    let tennisDataActive  = false;
+
+    function evalPoly(coeffs, t) {
+      let r = 0;
+      for (let i = coeffs.length - 1; i >= 0; i--) r = r * t + coeffs[i];
+      return r;
+    }
+
+    // Parses sample_tennis_data_v4.json into a flat, time-ordered skeleton-frame
+    // list (using every frame with player joint data, not just in-rally frames —
+    // a deliberate deviation from RegAR's per-rally replay, since this plays the
+    // whole match continuously) plus a list of ball-bounce events derived from
+    // "Skid" arcs (the brief ground-contact segment between a Hit and a Bounce
+    // arc) exactly as RegAR's TennisMotions.bounceEvents does — not from the
+    // frames[].ball.event_marker field, which the reference app also ignores.
+    function parseTennisMatchData(json) {
+      const t0abs = Date.parse(json.frames[0].ts);
+
+      const skelFrames = [];
+      for (const fr of json.frames) {
+        if (!fr.players || fr.players.length === 0) continue;
+        const t = (Date.parse(fr.ts) - t0abs) / 1000;
+        const byId = {};
+        for (const p of fr.players) {
+          if (!p.joints) continue;
+          byId[p.objectId] = p.joints.map(j => j
+            ? new THREE.Vector3(j[0] * FEET_PER_METER, j[1] * FEET_PER_METER, j[2] * FEET_PER_METER)
+            : null);
+        }
+        skelFrames.push({ t, players: byId });
+      }
+
+      const bounces = [];
+      for (const m of json.motions) {
+        if (m.arc_type !== 'Skid') continue;
+        const zeroAbs  = Date.parse(m.zero_time_utc);
+        const startAbs = Date.parse(m.ts_start);
+        const endAbs   = Date.parse(m.ts_end);
+        const tLocalMid = ((startAbs - zeroAbs) + (endAbs - zeroAbs)) / 2 / 1000;
+        const x = evalPoly(m.curve_params.x, tLocalMid) * FEET_PER_METER;
+        const y = evalPoly(m.curve_params.y, tLocalMid) * FEET_PER_METER;
+        const tGlobal = ((startAbs + endAbs) / 2 - t0abs) / 1000;
+        bounces.push({ t: tGlobal, pos: new THREE.Vector3(x, y, 0) });
+      }
+      bounces.sort((a, b) => a.t - b.t);
+
+      const duration = skelFrames.length ? skelFrames[skelFrames.length - 1].t : 0;
+      console.log(`[tennis-data] parsed ${skelFrames.length} skeleton frames, ` +
+                  `${bounces.length} bounces, duration ${duration.toFixed(1)}s`);
+      return { skelFrames, bounces, duration };
+    }
+
+    function buildSkeletonEntity(color) {
+      const material  = new THREE.MeshBasicMaterial({ color });
+      const sphereGeo = new THREE.SphereGeometry(TENNIS_JOINT_RADIUS, 10, 8);
+      const group  = new THREE.Group();
+      const joints = [];
+      const bones  = [];
+      for (let i = 0; i < TENNIS_JOINT_COUNT; i++) {
+        const m = new THREE.Mesh(sphereGeo, material);
+        m.visible = false;
+        m.frustumCulled = false;
+        group.add(m);
+        joints.push(m);
+      }
+      for (let i = 0; i < TENNIS_BONES.length; i++) {
+        const m = new THREE.Mesh(TENNIS_UNIT_CYLINDER, material);
+        m.visible = false;
+        m.frustumCulled = false;
+        group.add(m);
+        bones.push(m);
+      }
+      return { group, joints, bones };
+    }
+
+    const TENNIS_UP = new THREE.Vector3(0, 1, 0);
+
+    // Stretches/rotates a unit +Y cylinder to span from point a to point b —
+    // "scale Y to length, rotate +Y onto the bone direction" per RegAR's place().
+    function placeBone(mesh, a, b, radius) {
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      if (len < 1e-5) { mesh.visible = false; return; }
+      mesh.visible = true;
+      mesh.position.copy(a);
+      mesh.scale.set(radius, len, radius);
+      const dirN = dir.divideScalar(len);
+      const dot  = THREE.MathUtils.clamp(TENNIS_UP.dot(dirN), -1, 1);
+      if (dot > 1 - 1e-6) {
+        mesh.quaternion.identity();
+      } else if (dot < -1 + 1e-6) {
+        mesh.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+      } else {
+        const axis = new THREE.Vector3().crossVectors(TENNIS_UP, dirN).normalize();
+        mesh.quaternion.setFromAxisAngle(axis, Math.acos(dot));
+      }
+    }
+
+    function updateSkeletonEntity(entity, joints13) {
+      for (let i = 0; i < TENNIS_JOINT_COUNT; i++) {
+        const j = joints13 ? joints13[i] : null;
+        entity.joints[i].visible = !!j;
+        if (j) entity.joints[i].position.copy(j);
+      }
+      for (let i = 0; i < TENNIS_BONES.length; i++) {
+        const [ia, ib] = TENNIS_BONES[i];
+        const a = joints13 ? joints13[ia] : null;
+        const b = joints13 ? joints13[ib] : null;
+        if (a && b) placeBone(entity.bones[i], a, b, TENNIS_BONE_RADIUS);
+        else entity.bones[i].visible = false;
+      }
+    }
+
+    // Element-wise lerp between two frames' per-player joint arrays, falling
+    // back to whichever endpoint has a tracked value when the other is null —
+    // matches RegAR's SkeletonRallyPlayer interpolation fallback.
+    function lerpJointArrays(a, b, alpha) {
+      if (!a && !b) return null;
+      if (!a) return b;
+      if (!b) return a;
+      const n = Math.max(a.length, b.length);
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const pa = a[i], pb = b[i];
+        out[i] = (pa && pb) ? pa.clone().lerp(pb, alpha) : (pa || pb || null);
+      }
+      return out;
+    }
+
+    // Flat annulus (diameter 2 ft, ring width 0.3 ft — same dimensions as
+    // RegAR's makeBounceRing), unlit and opaque (grazing-angle translucent
+    // rings anti-alias into broken arcs — same rationale as the reference app).
+    function buildBounceRing() {
+      const geo = new THREE.RingGeometry(0.7, 1.0, 32);
+      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      return mesh;
+    }
+
+    async function loadTennisDataViz(exp) {
+      disposeTennisDataViz();
+
+      tennisDataGroup = new THREE.Group();
+      tennisDataGroup.position.copy(TENNIS_DATA_PREVIEW_POS);
+      tennisDataGroup.quaternion.copy(TENNIS_DATA_QUAT);
+      tennisDataGroup.scale.copy(TENNIS_DATA_SCALE);
+      scene.object3D.add(tennisDataGroup);
+
+      const { geometry, material } = await buildFieldContours(exp.contoursJson);
+      tennisCourtMesh = new THREE.Mesh(geometry, material);
+      tennisCourtMesh.frustumCulled = false;
+      tennisDataGroup.add(tennisCourtMesh);
+
+      tennisSkeletons = {};
+      for (const [id, color] of Object.entries(TENNIS_PLAYER_COLORS)) {
+        const entity = buildSkeletonEntity(color);
+        tennisDataGroup.add(entity.group);
+        tennisSkeletons[id] = entity;
+      }
+
+      const json = await fetch(exp.matchDataUrl).then(r => r.json());
+      tennisMatch = parseTennisMatchData(json);
+      tennisClock = 0;
+      tennisBounceRings = tennisMatch.bounces.map(b => {
+        const mesh = buildBounceRing();
+        mesh.position.copy(b.pos);
+        tennisDataGroup.add(mesh);
+        return { mesh, t: b.t, shown: false };
+      });
+
+      tennisDataActive = true;
+    }
+
+    function disposeTennisDataViz() {
+      tennisDataActive = false;
+      if (tennisDataGroup) scene.object3D.remove(tennisDataGroup);
+      if (tennisCourtMesh) { tennisCourtMesh.geometry.dispose(); tennisCourtMesh.material.dispose(); }
+      tennisDataGroup   = null;
+      tennisCourtMesh   = null;
+      tennisSkeletons   = {};
+      tennisBounceRings = [];
+      tennisMatch       = null;
+      tennisClock       = 0;
+    }
+
+    // Per-frame update: advances the rally clock (looping over the whole
+    // match), interpolates skeleton pose between the bracketing frames, and
+    // reveals each bounce ring once the clock passes its timestamp.
+    function updateTennisDataViz(dtMs) {
+      if (!tennisMatch || !tennisMatch.skelFrames.length) return;
+      // dt can be undefined on a component's very first tick, and can arrive as
+      // one huge jump after the tab was backgrounded (rAF throttling) — guard
+      // both, and loop (not just subtract once) so an oversized jump can't leave
+      // the clock permanently stuck past duration.
+      const dt = Number.isFinite(dtMs) ? dtMs / 1000 : 0;
+      tennisClock += dt;
+      while (tennisClock > tennisMatch.duration) {
+        tennisClock -= tennisMatch.duration;
+        for (const r of tennisBounceRings) { r.mesh.visible = false; r.shown = false; }
+      }
+
+      const frames = tennisMatch.skelFrames;
+      let lo = 0, hi = frames.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (frames[mid].t <= tennisClock) lo = mid; else hi = mid - 1;
+      }
+      const f0 = frames[lo];
+      const f1 = frames[Math.min(lo + 1, frames.length - 1)];
+      const span  = f1.t - f0.t;
+      const alpha = span > 1e-6 ? THREE.MathUtils.clamp((tennisClock - f0.t) / span, 0, 1) : 0;
+
+      for (const id in tennisSkeletons) {
+        const joints = lerpJointArrays(f0.players[id], f1.players[id], alpha);
+        updateSkeletonEntity(tennisSkeletons[id], joints);
+      }
+
+      for (const b of tennisBounceRings) {
+        if (!b.shown && tennisClock >= b.t) { b.shown = true; b.mesh.visible = true; }
+      }
+    }
+
+    // Re-anchors the tabletop diorama in front of the viewer's current head
+    // pose (yaw only) once an AR session starts — same head-pose-sampling
+    // pattern as placeScreenAtHead(), but with a fixed offset/tilt instead of
+    // registration-derived pitch/distance.
+    function placeTennisDataAtHead() {
+      const camPos  = new THREE.Vector3();
+      const camQuat = new THREE.Quaternion();
+      const xrCam = scene.renderer.xr.getCamera();
+      if (xrCam && xrCam.matrixWorld) {
+        camPos.setFromMatrixPosition(xrCam.matrixWorld);
+        camQuat.setFromRotationMatrix(xrCam.matrixWorld);
+      } else {
+        const cameraEl = document.querySelector('[camera]');
+        if (cameraEl && cameraEl.object3D) {
+          cameraEl.object3D.getWorldPosition(camPos);
+          cameraEl.object3D.getWorldQuaternion(camQuat);
+        } else {
+          setTimeout(placeTennisDataAtHead, 100);
+          return;
+        }
+      }
+      const euler   = new THREE.Euler().setFromQuaternion(camQuat, 'YXZ');
+      const yawQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, euler.y, 0));
+
+      const localOffset = new THREE.Vector3(0, -0.6, -1.1).applyQuaternion(yawQuat);
+      tennisDataGroup.position.copy(camPos.clone().add(localOffset));
+      tennisDataGroup.quaternion.copy(yawQuat.clone().multiply(TENNIS_DATA_QUAT));
+      tennisDataGroup.scale.copy(TENNIS_DATA_SCALE);
+      console.log(`[tennis-data] tabletop placed at (${tennisDataGroup.position.x.toFixed(3)}, ` +
+                  `${tennisDataGroup.position.y.toFixed(3)}, ${tennisDataGroup.position.z.toFixed(3)})`);
+    }
+
     // ─── App bootstrap ────────────────────────────────────────────────────────
 
     const scene    = document.getElementById('scene');
@@ -571,6 +899,12 @@
         rightJson:   'tennis_mat_cat_R_corr.json',
         contoursJson:['tennis_court_contours_net.json'],
         maskUrl:     '',
+      },
+      tennisSkeletons: {
+        label:        'Tennis / Skeletons',
+        dataOnly:     true,   // no video/registration — pure data visualization
+        contoursJson: ['tennis_court_contours_net.json'],
+        matchDataUrl: 'sample_tennis_data_v4.json',
       },
     };
 
@@ -944,7 +1278,10 @@
 
     // Pre-load registration JSON for both experiences in parallel.
     // Buttons enable once XR is confirmed AND both loads finish.
-    const regLoads = Object.entries(EXPERIENCES).map(([key, exp]) =>
+    // (dataOnly experiences carry no leftJson/rightJson — skip them here.)
+    const regLoads = Object.entries(EXPERIENCES)
+      .filter(([, exp]) => exp.leftJson && exp.rightJson)
+      .map(([key, exp]) =>
       Promise.all([
         fetch(exp.leftJson).then(r => r.json()),
         fetch(exp.rightJson).then(r => r.json())
@@ -1026,27 +1363,41 @@
       expButtons.forEach(b => { b.disabled = true; });
       statusEl.textContent = '';
 
-      // Switch video source — HLS (.m3u8) streams go through hls.js since
-      // Chrome has no native HLS <video> support.
-      if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
-      if (/\.m3u8(\?|$)/.test(exp.videoUrl) && window.Hls && Hls.isSupported()) {
-        hlsPlayer = new Hls();
-        hlsPlayer.on(Hls.Events.ERROR, (_, data) =>
-          console.error('[hls]', data.type, data.details, data.fatal ? '(fatal)' : ''));
-        hlsPlayer.loadSource(exp.videoUrl);
-        hlsPlayer.attachMedia(video);
+      if (exp.dataOnly) {
+        // No video/registration — pure data visualization (skeletons + rings).
+        video.pause();
+        if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+        quad.removeAttribute('stereo-tb');
+        for (const mesh of [leftFieldMesh, rightFieldMesh]) {
+          if (mesh) { scene.object3D.remove(mesh); mesh.geometry.dispose(); }
+        }
+        leftFieldMesh = rightFieldMesh = null;
+        await loadTennisDataViz(exp);
       } else {
-        video.src = exp.videoUrl;
-        video.load();
+        disposeTennisDataViz();
+
+        // Switch video source — HLS (.m3u8) streams go through hls.js since
+        // Chrome has no native HLS <video> support.
+        if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+        if (/\.m3u8(\?|$)/.test(exp.videoUrl) && window.Hls && Hls.isSupported()) {
+          hlsPlayer = new Hls();
+          hlsPlayer.on(Hls.Events.ERROR, (_, data) =>
+            console.error('[hls]', data.type, data.details, data.fatal ? '(fatal)' : ''));
+          hlsPlayer.loadSource(exp.videoUrl);
+          hlsPlayer.attachMedia(video);
+        } else {
+          video.src = exp.videoUrl;
+          video.load();
+        }
+
+        // Apply registration + stereo-tb component
+        applyExperienceReg(key, exp);
+
+        // Load contours for this sport
+        loadFieldContoursForExp(exp.contoursJson);
+
+        video.play().catch(e => console.warn('[video]', e));
       }
-
-      // Apply registration + stereo-tb component
-      applyExperienceReg(key, exp);
-
-      // Load contours for this sport
-      loadFieldContoursForExp(exp.contoursJson);
-
-      video.play().catch(e => console.warn('[video]', e));
 
       try {
         await (scene.enterAR ? scene.enterAR() : scene.enterVR());
@@ -1185,7 +1536,8 @@
       exitBtn.style.display = 'block';
       video.play().catch(e => console.warn('[video] play failed:', e));
       setTimeout(() => {
-        placeScreenAtHead();
+        if (tennisDataActive) placeTennisDataAtHead();
+        else placeScreenAtHead();
         placeMenuAtHead();
       }, 300);
 
@@ -1245,6 +1597,11 @@
           mesh.matrix.copy(previewMat);
           mesh.matrixWorldNeedsUpdate = true;
         }
+      }
+      if (tennisDataGroup) {
+        tennisDataGroup.position.copy(TENNIS_DATA_PREVIEW_POS);
+        tennisDataGroup.quaternion.copy(TENNIS_DATA_QUAT);
+        tennisDataGroup.scale.copy(TENNIS_DATA_SCALE);
       }
     });
 
