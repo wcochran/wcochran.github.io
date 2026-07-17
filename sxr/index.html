@@ -561,10 +561,27 @@
       [0, 8], [8, 10], [10, 12],  // neck → rHip → rKnee → rAnkle
       [7, 8]                      // lHip ↔ rHip (pelvis cross-bar)
     ];
-    const TENNIS_JOINT_COUNT  = 13;   // body joints drawn as spheres (racquet/indices 13-19 not yet ported)
+    const TENNIS_JOINT_COUNT  = 13;   // body joints drawn as spheres
     const TENNIS_BONE_RADIUS  = 0.07; // FOP feet
     const TENNIS_JOINT_RADIUS = 0.10; // FOP feet
     const TENNIS_PLAYER_COLORS = { S0AG: 0x00ffff, A0E2: 0xff9500 };  // Sinner cyan, Alcaraz orange
+
+    // Racquet (joint indices 13-19: handle, shaft, head, rightEdge, leftEdge,
+    // rightCorner, leftCorner). Grip runs handle→shaft, throat splits shaft to
+    // both corners; the hoop itself is a smooth closed loop, not straight bones
+    // — matches RegAR's SkeletonEntity.racquetBones/hoopJoints.
+    const TENNIS_RACQUET_BONES = [[13, 14], [14, 18], [14, 19]];
+    const TENNIS_RACQUET_RADIUS = 0.035; // FOP feet
+    // Rim order: rightCorner → rightEdge → head → leftEdge → leftCorner (loop
+    // closes back across the throat). A periodic Catmull-Rom through these five
+    // points plus two synthetic "shoulder" points (approximating a real
+    // racquet's egg shape — flat across the tip, tighter at the throat) gives
+    // the rounded head outline.
+    const TENNIS_HOOP_JOINTS = [18, 16, 15, 17, 19];
+    const TENNIS_HOOP_SAMPLES_PER_SEGMENT = 6;
+    const TENNIS_HOOP_SHOULDER_LATERAL = 0.88; // fraction of the rim's half-width
+    const TENNIS_HOOP_SHOULDER_HEIGHT  = 0.55; // fraction of the chord-center→tip height
+    const TENNIS_HOOP_CONTROL_COUNT = TENNIS_HOOP_JOINTS.length + 2; // rim + 2 shoulders
 
     // Ball trail — matches RegAR's TennisRallyBallPlayer/TennisRallyPlayer values.
     const COMET_TRAIL_FEET   = 16;    // length of the lit comet tail, FOP feet
@@ -810,7 +827,26 @@
         group.add(m);
         bones.push(m);
       }
-      return { group, joints, bones };
+      const racquetBones = [];
+      for (let i = 0; i < TENNIS_RACQUET_BONES.length; i++) {
+        const m = new THREE.Mesh(TENNIS_UNIT_CYLINDER, material);
+        m.visible = false;
+        m.frustumCulled = false;
+        m.renderOrder = 1;
+        group.add(m);
+        racquetBones.push(m);
+      }
+      const hoopSegments = [];
+      const hoopSegmentCount = TENNIS_HOOP_CONTROL_COUNT * TENNIS_HOOP_SAMPLES_PER_SEGMENT;
+      for (let i = 0; i < hoopSegmentCount; i++) {
+        const m = new THREE.Mesh(TENNIS_UNIT_CYLINDER, material);
+        m.visible = false;
+        m.frustumCulled = false;
+        m.renderOrder = 1;
+        group.add(m);
+        hoopSegments.push(m);
+      }
+      return { group, joints, bones, racquetBones, hoopSegments };
     }
 
     const TENNIS_UP = new THREE.Vector3(0, 1, 0);
@@ -836,19 +872,92 @@
       }
     }
 
-    function updateSkeletonEntity(entity, joints13) {
+    // joints20: full 20-element per-player joint array (13 body + 7 racquet
+    // points, indices as in meta.joint_order); any entry may be null/untracked.
+    function updateSkeletonEntity(entity, joints20) {
       for (let i = 0; i < TENNIS_JOINT_COUNT; i++) {
-        const j = joints13 ? joints13[i] : null;
+        const j = joints20 ? joints20[i] : null;
         entity.joints[i].visible = !!j;
         if (j) entity.joints[i].position.copy(j);
       }
       for (let i = 0; i < TENNIS_BONES.length; i++) {
         const [ia, ib] = TENNIS_BONES[i];
-        const a = joints13 ? joints13[ia] : null;
-        const b = joints13 ? joints13[ib] : null;
+        const a = joints20 ? joints20[ia] : null;
+        const b = joints20 ? joints20[ib] : null;
         if (a && b) placeBone(entity.bones[i], a, b, TENNIS_BONE_RADIUS);
         else entity.bones[i].visible = false;
       }
+      for (let i = 0; i < TENNIS_RACQUET_BONES.length; i++) {
+        const [ia, ib] = TENNIS_RACQUET_BONES[i];
+        const a = joints20 ? joints20[ia] : null;
+        const b = joints20 ? joints20[ib] : null;
+        if (a && b) placeBone(entity.racquetBones[i], a, b, TENNIS_RACQUET_RADIUS);
+        else entity.racquetBones[i].visible = false;
+      }
+      positionHoop(entity, joints20);
+    }
+
+    // Positions the smooth racquet-head hoop: a closed centripetal Catmull-Rom
+    // loop through the five rim joints plus two synthetic "shoulder" points
+    // (egg shape — flat top, tighter throat), rendered as short cylinder
+    // segments between consecutive loop samples. Hides entirely if any rim
+    // joint is untracked this frame — matches SkeletonEntity.positionHoop.
+    function positionHoop(entity, joints20) {
+      const rim = TENNIS_HOOP_JOINTS.map(i => joints20 ? joints20[i] : null);
+      if (rim.some(p => !p)) {
+        for (const seg of entity.hoopSegments) seg.visible = false;
+        return;
+      }
+      const [rc, re, head, le, lc] = rim;
+      const center  = re.clone().add(le).multiplyScalar(0.5);           // midpoint of the lateral chord
+      const lateral = re.clone().sub(le).multiplyScalar(0.5);          // chord half-width vector
+      const toTip   = head.clone().sub(center);                        // chord center → tip
+      const sr = center.clone()
+        .addScaledVector(lateral, TENNIS_HOOP_SHOULDER_LATERAL)
+        .addScaledVector(toTip, TENNIS_HOOP_SHOULDER_HEIGHT);
+      const sl = center.clone()
+        .addScaledVector(lateral, -TENNIS_HOOP_SHOULDER_LATERAL)
+        .addScaledVector(toTip, TENNIS_HOOP_SHOULDER_HEIGHT);
+      const controls = [rc, re, sr, head, sl, le, lc];
+      const loop = closedLoopPath(controls, TENNIS_HOOP_SAMPLES_PER_SEGMENT);
+      for (let k = 0; k < entity.hoopSegments.length; k++) {
+        placeBone(entity.hoopSegments[k], loop[k], loop[(k + 1) % loop.length], TENNIS_RACQUET_RADIUS);
+      }
+    }
+
+    // A smooth closed loop passing exactly through every control point in
+    // order (periodic centripetal Catmull-Rom, alpha=0.5) — mirrors
+    // CurveGenerator.closedLoopPath/centripetalCatmullRom. Returns
+    // points.length * samplesPerSegment points; consumers connect
+    // result[i]-result[(i+1) % result.length] to close the loop.
+    function closedLoopPath(points, samplesPerSegment) {
+      const n = points.length;
+      if (n < 3) return points;
+      const m = Math.max(1, samplesPerSegment);
+      const out = [];
+      for (let i = 0; i < n; i++) {
+        const p0 = points[(i + n - 1) % n];
+        const p1 = points[i];
+        const p2 = points[(i + 1) % n];
+        const p3 = points[(i + 2) % n];
+        for (let j = 0; j < m; j++) out.push(centripetalCatmullRom(p0, p1, p2, p3, j / m));
+      }
+      return out;
+    }
+
+    function centripetalCatmullRom(p0, p1, p2, p3, t) {
+      const knot = (a, b) => Math.max(Math.sqrt(a.distanceTo(b)), 1e-4);
+      const t0 = 0;
+      const t1 = t0 + knot(p0, p1);
+      const t2 = t1 + knot(p1, p2);
+      const t3 = t2 + knot(p2, p3);
+      const u = t1 + t * (t2 - t1);
+      const a1 = p0.clone().multiplyScalar((t1 - u) / (t1 - t0)).addScaledVector(p1, (u - t0) / (t1 - t0));
+      const a2 = p1.clone().multiplyScalar((t2 - u) / (t2 - t1)).addScaledVector(p2, (u - t1) / (t2 - t1));
+      const a3 = p2.clone().multiplyScalar((t3 - u) / (t3 - t2)).addScaledVector(p3, (u - t2) / (t3 - t2));
+      const b1 = a1.clone().multiplyScalar((t2 - u) / (t2 - t0)).addScaledVector(a2, (u - t0) / (t2 - t0));
+      const b2 = a2.clone().multiplyScalar((t3 - u) / (t3 - t1)).addScaledVector(a3, (u - t1) / (t3 - t1));
+      return b1.multiplyScalar((t2 - u) / (t2 - t1)).addScaledVector(b2, (u - t1) / (t2 - t1));
     }
 
     // Element-wise lerp between two frames' per-player joint arrays, falling
