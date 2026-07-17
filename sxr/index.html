@@ -935,18 +935,25 @@
       return geo;
     }
 
+    // Width offset computed in LOCAL (object) space, not world space — matches
+    // RegAR's ViewDirection/Normal nodes, which both declare space="model".
+    // uRibbonWidth is in the same FOP-feet units as the path geometry, so doing
+    // this in local space lets it shrink/grow through modelViewMatrix along
+    // with everything else. Doing it in world space (an earlier version of this
+    // port did) adds a feet-scale offset to an already-scaled-down world
+    // position — on the ~0.01x Mat Cat registration scale that blew a 0.5 ft
+    // ribbon up to ~40 ft.
     const RIBBON_VERTEX_SHADER = /* glsl */`
       attribute vec3 tangent;
       uniform float uRibbonWidth;
+      uniform vec3 uLocalCameraPos;
       varying vec2 vUv;
       void main() {
         vUv = uv;
-        vec3 worldPos = (modelMatrix * vec4(position, 1.0)).xyz;
-        vec3 worldTangent = normalize(mat3(modelMatrix) * tangent);
-        vec3 viewDir = normalize(cameraPosition - worldPos);
-        vec3 offsetDir = normalize(cross(viewDir, worldTangent));
-        worldPos += offsetDir * uv.x * uRibbonWidth;
-        gl_Position = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+        vec3 viewDir = normalize(uLocalCameraPos - position);
+        vec3 offsetDir = normalize(cross(viewDir, normalize(tangent)));
+        vec3 localPos = position + offsetDir * uv.x * uRibbonWidth;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(localPos, 1.0);
       }
     `;
 
@@ -979,6 +986,7 @@
       return new THREE.ShaderMaterial({
         uniforms: {
           uRibbonWidth:    { value: RIBBON_WIDTH },
+          uLocalCameraPos: { value: new THREE.Vector3() },
           uFractionAlong:  { value: 0 },
           uFractionBehind: { value: 0 },
           uTailFeather:    { value: 0.0001 },
@@ -1152,8 +1160,34 @@
         }
       }
 
+      updateRibbonCameraUniform();
       if (menuFullTrailOn) { hideCometTrail(); updateShotTrails(); }
       else                 { hideShotTrails(); updateCometTrail(); }
+    }
+
+    // Every ribbon parented directly onto leftFieldMesh/rightFieldMesh shares
+    // that mesh's matrixWorld (no additional local transform of its own), so
+    // the current-camera-position-in-local-space only needs computing once per
+    // eye per tick, then broadcasting to every ribbon on that side.
+    function updateRibbonCameraUniform() {
+      const xrCam = scene.renderer.xr.getCamera();
+      const camPos = new THREE.Vector3();
+      if (xrCam && xrCam.matrixWorld) {
+        camPos.setFromMatrixPosition(xrCam.matrixWorld);
+      } else {
+        const cameraEl = document.querySelector('[camera]');
+        if (cameraEl && cameraEl.object3D) cameraEl.object3D.getWorldPosition(camPos);
+      }
+      for (const [parentMesh, ribbonSets] of [
+        [leftFieldMesh,  [tennisCometRibbonsL, tennisShotRibbonsL]],
+        [rightFieldMesh, [tennisCometRibbonsR, tennisShotRibbonsR]]
+      ]) {
+        if (!parentMesh) continue;
+        const localCamPos = parentMesh.worldToLocal(camPos.clone());
+        for (const set of ribbonSets) {
+          for (const entry of set) entry.mesh.material.uniforms.uLocalCameraPos.value.copy(localCamPos);
+        }
+      }
     }
 
     // Largest index whose cumulative length is <= target (binary search) —
