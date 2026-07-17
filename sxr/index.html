@@ -775,12 +775,19 @@
         for (const [id, color] of Object.entries(TENNIS_PLAYER_COLORS)) {
           const entity = buildSkeletonEntity(color);
           parentMesh.add(entity.group);
+          // Match the parent's CURRENT layer mask now — this fetch can easily
+          // outlast placeScreenAtHead()'s one-time retroactive layer-propagate
+          // (it's on a fixed 300ms timer), so don't rely on that alone or a
+          // late-arriving overlay is left on the default layer, visible to
+          // both eyes instead of just this one.
+          entity.group.traverse(o => { if (o.isMesh) o.layers.mask = parentMesh.layers.mask; });
           skelMap[id] = entity;
         }
         const rings = tennisMatch.bounces.map(b => {
           const mesh = buildBounceRing();
           mesh.position.copy(b.pos);
           parentMesh.add(mesh);
+          mesh.layers.mask = parentMesh.layers.mask;
           return { mesh, t: b.t, shown: false };
         });
         if (eye === 'L') { tennisSkeletonsL = skelMap; tennisBounceRingsL = rings; }
