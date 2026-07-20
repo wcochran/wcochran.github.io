@@ -583,6 +583,12 @@
     const TENNIS_HOOP_SHOULDER_HEIGHT  = 0.55; // fraction of the chord-center→tip height
     const TENNIS_HOOP_CONTROL_COUNT = TENNIS_HOOP_JOINTS.length + 2; // rim + 2 shoulders
 
+    // Real between-point breaks in the source match run 15-30s — this app plays
+    // the whole match continuously rather than one on-demand rally at a time,
+    // so waiting that long between points is deadly. Once a gap has been
+    // waited out this long, jump straight to the next rally's start instead.
+    const MAX_GAP_SECONDS = 3;
+
     // Ball trail — matches RegAR's TennisRallyBallPlayer/TennisRallyPlayer values.
     const COMET_TRAIL_FEET   = 16;    // length of the lit comet tail, FOP feet
     const RIBBON_WIDTH       = 0.25;  // FOP feet (see stereo-tb note: no /2 — matches ribbon_material.usda's raw side*ribbonWidth offset)
@@ -625,6 +631,13 @@
     // rings/persistent shot trails clear at each rally boundary, not just once
     // per full match loop.
     let tennisLastRallyIndex = -2;
+    // Segment id of whichever rally is current (persists through the gap after
+    // it ends, until the next rally actually starts) — null once out of range
+    // of any known rally. Gates bounce-ring/shot-ribbon reveal so an item from
+    // a since-finished rally can never re-satisfy "tennisClock has passed its
+    // timestamp" and pop back up (see updateShotTrails/the bounce reveal loop).
+    let tennisCurrentRallySegment = null;
+    let tennisGapElapsed = 0; // real seconds waited so far in the current inter-rally gap
 
     function evalPoly(coeffs, t) {
       let r = 0;
@@ -688,7 +701,7 @@
           const x = evalPoly(m.curve_params.x, tLocalMid) * FEET_PER_METER;
           const y = evalPoly(m.curve_params.y, tLocalMid) * FEET_PER_METER;
           const tGlobal = ((startAbs + endAbs) / 2 - t0abs) / 1000;
-          bounces.push({ t: tGlobal, pos: new THREE.Vector3(x, y, 0) });
+          bounces.push({ t: tGlobal, pos: new THREE.Vector3(x, y, 0), segment: m.segment });
         }
       }
       arcs.sort((a, b) => a.tGlobalStart - b.tGlobalStart);
@@ -778,7 +791,7 @@
         for (let i = 1; i < path.length; i++) {
           cumulativeLength.push(cumulativeLength[i - 1] + path[i].distanceTo(path[i - 1]));
         }
-        rallies.push({ tGlobalStart, tGlobalEnd, path, cumulativeLength,
+        rallies.push({ segment: segArcs[0].segment, tGlobalStart, tGlobalEnd, path, cumulativeLength,
                         totalLength: cumulativeLength[cumulativeLength.length - 1] });
       }
       rallies.sort((a, b) => a.tGlobalStart - b.tGlobalStart);
@@ -801,7 +814,7 @@
           }
         }
         const path = sampleArcPath([a], a.tGlobalStart, a.tGlobalEnd, SHOT_PATH_SAMPLES);
-        out.push({ tGlobalStart: a.tGlobalStart, tGlobalEnd: a.tGlobalEnd, path, color: lastColor });
+        out.push({ segment: a.segment, tGlobalStart: a.tGlobalStart, tGlobalEnd: a.tGlobalEnd, path, color: lastColor });
       }
       return out;
     }
@@ -1162,6 +1175,8 @@
       tennisMatch = null;
       tennisClock = 0;
       tennisLastRallyIndex = -2;
+      tennisCurrentRallySegment = null;
+      tennisGapElapsed = 0;
       tennisOverlayActive = false;
     }
 
@@ -1254,7 +1269,30 @@
       // both, and loop (not just subtract once) so an oversized jump can't leave
       // the clock permanently stuck past duration.
       const dt = Number.isFinite(dtMs) ? dtMs / 1000 : 0;
-      tennisClock += dt;
+
+      // Real between-point gaps run 15-30s; waiting them out in full would make
+      // continuous whole-match playback deadly slow. If we're not currently
+      // inside a rally, advance normally only until MAX_GAP_SECONDS of real
+      // time has been waited, then jump straight to the next rally's start —
+      // nothing renders during a gap anyway (no tracked skeleton/ball data
+      // exists there), so there's nothing to fast-forward through, just a wait
+      // to shorten.
+      const rallies = tennisMatch.ballRallies;
+      const inRallyNow = rallies.length > 0 &&
+        rallies.some(r => tennisClock >= r.tGlobalStart && tennisClock <= r.tGlobalEnd);
+      if (inRallyNow || rallies.length === 0) {
+        tennisClock += dt;
+        tennisGapElapsed = 0;
+      } else {
+        tennisGapElapsed += dt;
+        if (tennisGapElapsed >= MAX_GAP_SECONDS) {
+          const next = rallies.find(r => r.tGlobalStart > tennisClock);
+          tennisClock = next ? next.tGlobalStart : (tennisMatch.duration + rallies[0].tGlobalStart);
+          tennisGapElapsed = 0;
+        } else {
+          tennisClock += dt;
+        }
+      }
       while (tennisClock > tennisMatch.duration) {
         tennisClock -= tennisMatch.duration;
         clearRingsAndShotTrails();
@@ -1280,17 +1318,22 @@
       // Clear rings/persistent trails at every rally boundary (not just once
       // per full match loop) — includes both rally→gap and gap→rally
       // transitions, so nothing from a finished rally lingers into the gap
-      // before the next one starts.
-      const activeRallyIndex = tennisMatch.ballRallies.findIndex(
+      // before the next one starts. tennisCurrentRallySegment additionally
+      // gates reveal below so a since-finished rally's items can never
+      // re-satisfy "tennisClock has passed my timestamp" and pop back up.
+      const activeRallyIndex = rallies.findIndex(
         r => tennisClock >= r.tGlobalStart && tennisClock <= r.tGlobalEnd);
       if (activeRallyIndex !== tennisLastRallyIndex) {
         clearRingsAndShotTrails();
         tennisLastRallyIndex = activeRallyIndex;
       }
+      tennisCurrentRallySegment = activeRallyIndex >= 0 ? rallies[activeRallyIndex].segment : null;
 
       for (const rings of [tennisBounceRingsL, tennisBounceRingsR]) {
         for (const b of rings) {
-          if (!b.shown && tennisClock >= b.t) { b.shown = true; b.mesh.visible = true; }
+          if (!b.shown && b.segment === tennisCurrentRallySegment && tennisClock >= b.t) {
+            b.shown = true; b.mesh.visible = true;
+          }
         }
       }
 
@@ -1387,11 +1430,13 @@
 
     // Full/persistent mode: each Hit/Bounce arc's ribbon draws in once its start
     // time arrives, then stays fully drawn (fractionAlong clamps at 1) for the
-    // rest of this loop of the match — mirrors TennisRallyPlayer.update(dt:).
+    // rest of THIS rally — mirrors TennisRallyPlayer.update(dt:). Gated to the
+    // current rally's segment so a since-finished rally's arcs (whose start
+    // time is necessarily already in the past) never re-satisfy "started".
     function updateShotTrails() {
       for (let i = 0; i < tennisMatch.shotArcs.length; i++) {
         const arc = tennisMatch.shotArcs[i];
-        const started = tennisClock >= arc.tGlobalStart;
+        const started = arc.segment === tennisCurrentRallySegment && tennisClock >= arc.tGlobalStart;
         for (const ribbons of [tennisShotRibbonsL, tennisShotRibbonsR]) {
           const entry = ribbons[i];
           if (!started) { entry.mesh.visible = false; continue; }
