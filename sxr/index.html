@@ -1211,7 +1211,7 @@
           mesh.position.copy(b.pos);
           parentMesh.add(mesh);
           mesh.layers.mask = parentMesh.layers.mask;
-          return { mesh, t: b.t, shown: false };
+          return { mesh, t: b.t, segment: b.segment, shown: false };
         });
 
         const fallbackColor = Object.values(TENNIS_PLAYER_COLORS)[0] ?? 0xffffff;
